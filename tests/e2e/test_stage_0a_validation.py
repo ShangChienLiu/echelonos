@@ -27,10 +27,6 @@ try:
 except ImportError:
     _classify_format = None
 
-try:
-    from echelonos.stages.stage_0a_validation import _check_pdf_text_layer
-except ImportError:
-    _check_pdf_text_layer = None
 
 try:
     from echelonos.stages.stage_0a_validation import _extract_html_text
@@ -105,22 +101,16 @@ class TestValidateFilePdf:
     """Tests for validate_file() with PDF inputs."""
 
     def test_valid_pdf_with_text_passes(self, sample_pdf: Path) -> None:
-        """A PDF with extractable text content must return VALID, needs_ocr=False.
+        """A PDF with extractable text content must return VALID, needs_ocr=True.
 
-        The minimal test PDF has only 13 chars ("Test contract") which is below
-        the 50-char/page threshold.  We mock the text-layer check to simulate a
-        real text-bearing PDF.
+        All PDFs are sent to OCR unconditionally.
         """
-        with patch(
-            "echelonos.stages.stage_0a_validation._check_pdf_text_layer",
-            return_value=True,
-        ):
-            result = validate_file(str(sample_pdf))
+        result = validate_file(str(sample_pdf))
 
         assert result["status"] == "VALID"
         assert result["original_format"] == "PDF"
         assert result["file_path"] == str(sample_pdf)
-        assert result["needs_ocr"] is False
+        assert result["needs_ocr"] is True
         assert result["reason"]  # non-empty string
 
     def test_image_only_pdf_needs_ocr(self, tmp_org_folder: Path) -> None:
@@ -634,19 +624,11 @@ class TestNewOutputFields:
         result = validate_file(str(sample_pdf))
         _assert_result_schema(result)
 
-    def test_needs_ocr_false_for_text_pdf(self, sample_pdf: Path) -> None:
-        """A text-bearing PDF must have needs_ocr=False.
+    def test_needs_ocr_true_for_pdf(self, sample_pdf: Path) -> None:
+        """All PDFs must have needs_ocr=True (OCR applied unconditionally)."""
+        result = validate_file(str(sample_pdf))
 
-        The minimal test PDF has too few chars for the threshold, so we
-        mock the text-layer check.
-        """
-        with patch(
-            "echelonos.stages.stage_0a_validation._check_pdf_text_layer",
-            return_value=True,
-        ):
-            result = validate_file(str(sample_pdf))
-
-        assert result["needs_ocr"] is False
+        assert result["needs_ocr"] is True
 
     def test_child_files_empty_for_non_container(self, sample_pdf: Path) -> None:
         """A non-container file (PDF) must have an empty child_files list."""

@@ -262,14 +262,10 @@ class TestStage0aValidationRexair:
     """Stage 0a validation for each Rexair file type."""
 
     def test_pdf_validates_as_valid(self, rexair_pdf: Path) -> None:
-        with patch(
-            "echelonos.stages.stage_0a_validation._check_pdf_text_layer",
-            return_value=True,
-        ):
-            result = validate_file(str(rexair_pdf))
+        result = validate_file(str(rexair_pdf))
         assert result["status"] == "VALID", f"PDF failed: {result['reason']}"
         assert result["original_format"] == "PDF"
-        assert result["needs_ocr"] is False
+        assert result["needs_ocr"] is True
 
     def test_docx_validates_as_valid(self, rexair_docx: Path) -> None:
         result = validate_file(str(rexair_docx))
@@ -979,11 +975,7 @@ class TestFullPipelineRexair:
 
         # --- Stage 0a: Validation ---
         try:
-            with patch(
-                "echelonos.stages.stage_0a_validation._check_pdf_text_layer",
-                return_value=True,
-            ):
-                validated = validate_folder(str(rexair_org))
+            validated = validate_folder(str(rexair_org))
             valid_files = [f for f in validated if f["status"] == "VALID"]
             assert len(valid_files) >= 1, f"No valid files found in {rexair_org}"
         except Exception as e:

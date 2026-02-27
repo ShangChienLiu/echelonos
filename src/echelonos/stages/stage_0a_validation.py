@@ -69,9 +69,6 @@ REJECTED_MIME_TYPES: set[str] = {
 ZIP_MAX_FILES = 100
 ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB
 
-# Minimum average characters per page to consider a PDF text-extractable.
-PDF_TEXT_CHAR_THRESHOLD = 50
-
 
 # ---------------------------------------------------------------------------
 # Internal HTML text-stripping helper
@@ -195,46 +192,6 @@ def _classify_format(mime_type: str) -> tuple[str, str]:
 # PDF helpers
 # ---------------------------------------------------------------------------
 
-
-def _check_pdf_text_layer(file_path: str) -> bool:
-    """Determine whether a PDF has a usable text layer.
-
-    Extracts text from every page via pypdf and computes the average
-    character count per page.  If the average is below
-    ``PDF_TEXT_CHAR_THRESHOLD`` (50 chars), the PDF is considered
-    image-only and requires OCR.
-
-    Returns
-    -------
-    bool
-        ``True`` if the PDF has sufficient extractable text (no OCR needed),
-        ``False`` if it is image-only (OCR needed).
-    """
-    try:
-        reader = PdfReader(file_path)
-        num_pages = len(reader.pages)
-        if num_pages == 0:
-            return False
-
-        total_chars = 0
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            total_chars += len(text)
-
-        avg_chars = total_chars / num_pages
-        has_text = avg_chars >= PDF_TEXT_CHAR_THRESHOLD
-        log.debug(
-            "pdf_text_layer_check",
-            file_path=file_path,
-            total_chars=total_chars,
-            num_pages=num_pages,
-            avg_chars_per_page=round(avg_chars, 1),
-            has_text=has_text,
-        )
-        return has_text
-    except Exception as exc:
-        log.warning("pdf_text_layer_check_failed", file_path=file_path, error=str(exc))
-        return False
 
 
 def _validate_pdf(file_path: str) -> dict | None:
@@ -660,19 +617,18 @@ def validate_file(file_path: str, extracted_from: str | None = None) -> dict:
             if err is not None:
                 err["extracted_from"] = extracted_from
                 return err
-            needs_ocr = not _check_pdf_text_layer(file_path)
             log.info(
                 "file_valid",
                 file_path=file_path,
                 original_format="PDF",
-                needs_ocr=needs_ocr,
+                needs_ocr=True,
             )
             return _make_result(
                 file_path,
                 "VALID",
                 "File passed all validation checks",
                 "PDF",
-                needs_ocr=needs_ocr,
+                needs_ocr=True,
                 extracted_from=extracted_from,
             )
 
