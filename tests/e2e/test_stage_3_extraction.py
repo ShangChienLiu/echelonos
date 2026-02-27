@@ -1,12 +1,11 @@
-"""E2E tests for Stage 3: Obligation Extraction + Verification.
+"""E2E tests for Stage 3: Obligation Extraction + Dual Ensemble Verification.
 
-All LLM calls (Claude structured output and Claude verification) are mocked
-to enable deterministic testing without API keys or network access.
+All LLM calls (Claude structured output) are mocked to enable deterministic
+testing without API keys or network access.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,12 +13,14 @@ import pytest
 from echelonos.stages.stage_3_extraction import (
     Obligation,
     ExtractionResult,
+    check_agreement,
     extract_and_verify,
     extract_obligations,
+    extract_obligations_independent,
     extract_party_roles,
+    match_extractions,
     run_cove,
     verify_grounding,
-    verify_with_claude,
 )
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,25 @@ SAMPLE_OBLIGATION = Obligation(
     confidence=0.95,
 )
 
+# Independent extraction of the same obligation -- slightly different wording.
+SAMPLE_OBLIGATION_INDEPENDENT = Obligation(
+    obligation_text=(
+        "Vendor is required to deliver hardware components to Client's "
+        "designated facility within 30 calendar days of purchase order."
+    ),
+    obligation_type="Delivery",
+    responsible_party="Vendor",
+    counterparty="Client",
+    frequency=None,
+    deadline="30 calendar days of the purchase order date",
+    source_clause=(
+        "The Vendor shall deliver all hardware components to the Client's "
+        "designated facility within 30 calendar days of the purchase order date."
+    ),
+    source_page=1,
+    confidence=0.92,
+)
+
 SAMPLE_LOW_CONFIDENCE_OBLIGATION = Obligation(
     obligation_text="Vendor must provide status reports to the Client.",
     obligation_type="Delivery",
@@ -101,19 +121,6 @@ def _patch_structured_side_effect(side_effect):
         "echelonos.stages.stage_3_extraction.extract_with_structured_output",
         side_effect=side_effect,
     )
-
-
-def _make_anthropic_response(text: str):
-    """Build a mock Anthropic messages.create response."""
-    content_block = SimpleNamespace(text=text)
-    return SimpleNamespace(content=[content_block])
-
-
-def _mock_anthropic_client():
-    """Return a MagicMock that behaves like an Anthropic client."""
-    client = MagicMock()
-    client.messages.create = MagicMock()
-    return client
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +173,24 @@ class TestExtractObligations:
         assert first.confidence == 0.95
         assert first.source_page == 1
 
+    def test_extract_obligations_independent(self) -> None:
+        """Independent extraction uses different prompt but same schema."""
+        from echelonos.stages.stage_3_extraction import _ExtractionResponse
+
+        obligations = [SAMPLE_OBLIGATION_INDEPENDENT]
+        expected = _ExtractionResponse(obligations=obligations)
+
+        with _patch_structured(expected):
+            result = extract_obligations_independent(
+                SAMPLE_CONTRACT_TEXT,
+                SAMPLE_PARTY_ROLES,
+                claude_client=MagicMock(),
+            )
+
+        assert isinstance(result, ExtractionResult)
+        assert len(result.obligations) == 1
+        assert result.obligations[0].obligation_type == "Delivery"
+
 
 class TestGroundingCheck:
     """Tests for verify_grounding()."""
@@ -190,68 +215,119 @@ class TestGroundingCheck:
         assert verify_grounding(fabricated, SAMPLE_CONTRACT_TEXT) is False
 
 
-class TestClaudeVerification:
-    """Tests for verify_with_claude()."""
+class TestMatchExtractions:
+    """Tests for match_extractions()."""
 
-    def test_claude_verification_agrees(self) -> None:
-        """Claude confirms the obligation is verified."""
-        mock_client = _mock_anthropic_client()
-        mock_client.messages.create.return_value = _make_anthropic_response(
-            '{"verified": true, "confidence": 0.95, '
-            '"reason": "The source clause exists verbatim in the document and '
-            'the obligation accurately reflects the contractual requirement."}'
+    def test_matching_pairs_by_source_clause(self) -> None:
+        """Obligations with similar source_clause are paired together."""
+        primary = [SAMPLE_OBLIGATION]
+        independent = [SAMPLE_OBLIGATION_INDEPENDENT]
+
+        pairs = match_extractions(primary, independent)
+
+        assert len(pairs) == 1
+        p_obl, ind_obl = pairs[0]
+        assert p_obl == SAMPLE_OBLIGATION
+        assert ind_obl == SAMPLE_OBLIGATION_INDEPENDENT
+
+    def test_unmatched_primary_becomes_solo(self) -> None:
+        """Primary obligation with no match produces (primary, None)."""
+        unique_obligation = Obligation(
+            obligation_text="Vendor must provide training.",
+            obligation_type="Delivery",
+            responsible_party="Vendor",
+            counterparty="Client",
+            frequency=None,
+            deadline=None,
+            source_clause="The Vendor shall provide on-site training sessions.",
+            source_page=2,
+            confidence=0.80,
         )
 
-        result = verify_with_claude(
-            SAMPLE_OBLIGATION,
-            SAMPLE_CONTRACT_TEXT,
-            anthropic_client=mock_client,
-        )
+        pairs = match_extractions([unique_obligation], [])
 
-        assert result["verified"] is True
-        assert result["confidence"] == 0.95
-        assert isinstance(result["reason"], str)
-        assert len(result["reason"]) > 0
+        assert len(pairs) == 1
+        assert pairs[0] == (unique_obligation, None)
 
-        mock_client.messages.create.assert_called_once()
-
-    def test_claude_verification_disagrees(self) -> None:
-        """Claude disputes the obligation -- verified=False."""
-        fabricated = Obligation(
-            obligation_text="Client must pay within 10 days.",
-            obligation_type="Financial",
+    def test_unmatched_independent_appended(self) -> None:
+        """Independent-only obligations are appended as SOLO entries."""
+        unique_ind = Obligation(
+            obligation_text="Client must provide access to facilities.",
+            obligation_type="Delivery",
             responsible_party="Client",
             counterparty="Vendor",
             frequency=None,
-            deadline="10 days",
-            source_clause="The Client shall pay the Vendor within 10 days.",
-            source_page=1,
-            confidence=0.70,
+            deadline=None,
+            source_clause="The Client shall provide access to all designated facilities.",
+            source_page=3,
+            confidence=0.85,
         )
 
-        mock_client = _mock_anthropic_client()
-        mock_client.messages.create.return_value = _make_anthropic_response(
-            '{"verified": false, "confidence": 0.30, '
-            '"reason": "The source clause does not exist in the document. '
-            'The actual payment term is 45 days, not 10 days."}'
+        pairs = match_extractions([], [unique_ind])
+
+        assert len(pairs) == 1
+        assert pairs[0] == (unique_ind, None)
+
+    def test_mixed_matched_and_solo(self) -> None:
+        """Mix of matched and unmatched obligations."""
+        solo_primary = Obligation(
+            obligation_text="Vendor must provide training.",
+            obligation_type="Delivery",
+            responsible_party="Vendor",
+            counterparty="Client",
+            frequency=None,
+            deadline=None,
+            source_clause="The Vendor shall provide on-site training sessions.",
+            source_page=2,
+            confidence=0.80,
         )
 
-        result = verify_with_claude(
-            fabricated,
-            SAMPLE_CONTRACT_TEXT,
-            anthropic_client=mock_client,
+        pairs = match_extractions(
+            [SAMPLE_OBLIGATION, solo_primary],
+            [SAMPLE_OBLIGATION_INDEPENDENT],
         )
 
-        assert result["verified"] is False
-        assert result["confidence"] == 0.30
-        assert "10 days" in result["reason"] or "45 days" in result["reason"]
+        assert len(pairs) == 2
+        # First pair: matched
+        assert pairs[0][1] == SAMPLE_OBLIGATION_INDEPENDENT
+        # Second pair: solo primary
+        assert pairs[1] == (solo_primary, None)
+
+
+class TestCheckAgreement:
+    """Tests for check_agreement()."""
+
+    def test_agreement_when_matching(self) -> None:
+        """Two obligations with same type, party, and similar text agree."""
+        assert check_agreement(SAMPLE_OBLIGATION, SAMPLE_OBLIGATION_INDEPENDENT) is True
+
+    def test_disagreement_on_type(self) -> None:
+        """Different obligation_type causes disagreement."""
+        different_type = SAMPLE_OBLIGATION_INDEPENDENT.model_copy(
+            update={"obligation_type": "Financial"}
+        )
+        assert check_agreement(SAMPLE_OBLIGATION, different_type) is False
+
+    def test_disagreement_on_party(self) -> None:
+        """Different responsible_party causes disagreement."""
+        different_party = SAMPLE_OBLIGATION_INDEPENDENT.model_copy(
+            update={"responsible_party": "Client"}
+        )
+        assert check_agreement(SAMPLE_OBLIGATION, different_party) is False
+
+    def test_disagreement_on_text(self) -> None:
+        """Vastly different obligation_text causes disagreement."""
+        different_text = SAMPLE_OBLIGATION_INDEPENDENT.model_copy(
+            update={"obligation_text": "Something completely unrelated to anything."}
+        )
+        assert check_agreement(SAMPLE_OBLIGATION, different_text) is False
 
 
 class TestCoVe:
     """Tests for run_cove() Chain-of-Verification."""
 
-    def test_cove_runs_for_low_confidence(self) -> None:
-        """CoVe runs and passes when all answers are found in the document."""
+    def test_cove_passes_when_all_found(self) -> None:
+        """CoVe passes when all answers are found in the document."""
         from echelonos.stages.stage_3_extraction import (
             _CoVeAnswersResponse,
             _CoVeQuestionsResponse,
@@ -282,62 +358,48 @@ class TestCoVe:
         assert len(result["questions"]) == 3
         assert len(result["answers"]) == 3
 
-    def test_cove_skipped_for_high_confidence(self) -> None:
-        """CoVe is not triggered when confidence >= 0.80.
-
-        This test verifies the orchestrator behaviour rather than run_cove()
-        itself -- the orchestrator should skip CoVe for high-confidence
-        obligations.
-        """
+    def test_cove_fails_when_not_found(self) -> None:
+        """CoVe fails when answers contain NOT FOUND."""
         from echelonos.stages.stage_3_extraction import (
-            _ExtractionResponse,
-            _PartyRolesResponse,
-        )
-
-        mock_claude = MagicMock()
-        mock_claude.messages.create.return_value = _make_anthropic_response(
-            '{"verified": true, "confidence": 0.95, "reason": "Verified."}'
+            _CoVeAnswersResponse,
+            _CoVeQuestionsResponse,
         )
 
         with _patch_structured_side_effect([
-            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
-            _ExtractionResponse(obligations=[SAMPLE_OBLIGATION]),
-            # No CoVe calls expected.
+            _CoVeQuestionsResponse(questions=["Q1?", "Q2?"]),
+            _CoVeAnswersResponse(answers=["Answer 1", "NOT FOUND"]),
         ]):
-            results = extract_and_verify(
+            result = run_cove(
+                SAMPLE_LOW_CONFIDENCE_OBLIGATION,
                 SAMPLE_CONTRACT_TEXT,
-                claude_client=mock_claude,
+                claude_client=MagicMock(),
             )
 
-        assert len(results) == 1
-        # CoVe should be None because confidence (0.95) >= 0.80.
-        assert results[0]["cove"] is None
+        assert result["cove_passed"] is False
 
 
 class TestFullPipeline:
     """End-to-end pipeline tests for extract_and_verify()."""
 
-    def test_full_pipeline(self) -> None:
-        """Full pipeline: extract -> ground -> verify -> result."""
+    def test_full_pipeline_agreed_verified(self) -> None:
+        """Both extractions agree and grounding passes -> VERIFIED."""
         from echelonos.stages.stage_3_extraction import (
             _ExtractionResponse,
             _PartyRolesResponse,
         )
 
-        mock_claude = MagicMock()
-        # Claude verification agrees.
-        mock_claude.messages.create.return_value = _make_anthropic_response(
-            '{"verified": true, "confidence": 0.92, '
-            '"reason": "The obligation is accurately extracted."}'
-        )
-
         with _patch_structured_side_effect([
+            # Call 1: party roles
             _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
+            # Call 2: primary extraction
             _ExtractionResponse(obligations=[SAMPLE_OBLIGATION]),
+            # Call 3: independent extraction (agrees)
+            _ExtractionResponse(obligations=[SAMPLE_OBLIGATION_INDEPENDENT]),
+            # No CoVe calls -- AGREED path
         ]):
             results = extract_and_verify(
                 SAMPLE_CONTRACT_TEXT,
-                claude_client=mock_claude,
+                claude_client=MagicMock(),
             )
 
         assert len(results) == 1
@@ -350,65 +412,19 @@ class TestFullPipeline:
         # Grounding passes (source_clause is in the contract text).
         assert entry["grounding"] is True
 
-        # Claude verification passes.
-        assert entry["claude_verification"]["verified"] is True
+        # Ensemble shows agreement.
+        assert entry["ensemble"]["agreement"] == "AGREED"
+        assert entry["ensemble"]["primary_extraction"] is not None
+        assert entry["ensemble"]["independent_extraction"] is not None
 
-        # No CoVe needed (high confidence).
+        # No CoVe needed (AGREED).
         assert entry["cove"] is None
 
         # Final status.
         assert entry["status"] == "VERIFIED"
 
-    def test_unverified_marking(self) -> None:
-        """Obligation with failed grounding + Claude disagreement -> UNVERIFIED."""
-        from echelonos.stages.stage_3_extraction import (
-            _ExtractionResponse,
-            _PartyRolesResponse,
-        )
-
-        # Create an obligation whose source_clause does NOT appear in the text.
-        bad_obligation = Obligation(
-            obligation_text="Vendor must deliver within 7 business days.",
-            obligation_type="Delivery",
-            responsible_party="Vendor",
-            counterparty="Client",
-            frequency=None,
-            deadline="7 business days",
-            source_clause="The Vendor shall deliver within 7 business days.",
-            source_page=1,
-            confidence=0.85,
-        )
-
-        mock_claude = MagicMock()
-        mock_claude.messages.create.return_value = _make_anthropic_response(
-            '{"verified": false, "confidence": 0.20, '
-            '"reason": "The source clause does not exist in the document. '
-            'The actual delivery term is 30 calendar days, not 7 business days."}'
-        )
-
-        with _patch_structured_side_effect([
-            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
-            _ExtractionResponse(obligations=[bad_obligation]),
-        ]):
-            results = extract_and_verify(
-                SAMPLE_CONTRACT_TEXT,
-                claude_client=mock_claude,
-            )
-
-        assert len(results) == 1
-        entry = results[0]
-
-        # Grounding fails (fabricated clause).
-        assert entry["grounding"] is False
-
-        # Claude also disagrees.
-        assert entry["claude_verification"]["verified"] is False
-
-        # Final status is UNVERIFIED.
-        assert entry["status"] == "UNVERIFIED"
-
-    def test_pipeline_with_cove_triggered(self) -> None:
-        """Low-confidence obligation triggers CoVe in the full pipeline."""
+    def test_unverified_disagreement(self) -> None:
+        """Extractions disagree + CoVe fails -> UNVERIFIED."""
         from echelonos.stages.stage_3_extraction import (
             _CoVeAnswersResponse,
             _CoVeQuestionsResponse,
@@ -416,31 +432,75 @@ class TestFullPipeline:
             _PartyRolesResponse,
         )
 
-        mock_claude = MagicMock()
-        mock_claude.messages.create.return_value = _make_anthropic_response(
-            '{"verified": true, "confidence": 0.88, '
-            '"reason": "Obligation matches the source clause."}'
+        # Independent extraction has different obligation_type.
+        disagreeing_obligation = SAMPLE_OBLIGATION_INDEPENDENT.model_copy(
+            update={"obligation_type": "Financial"}
         )
 
         with _patch_structured_side_effect([
+            # Call 1: party roles
             _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
-            _ExtractionResponse(obligations=[SAMPLE_LOW_CONFIDENCE_OBLIGATION]),
+            # Call 2: primary extraction
+            _ExtractionResponse(obligations=[SAMPLE_OBLIGATION]),
+            # Call 3: independent extraction (disagrees on type)
+            _ExtractionResponse(obligations=[disagreeing_obligation]),
+            # Call 4: CoVe questions (triggered by DISAGREED)
+            _CoVeQuestionsResponse(questions=["Is the type correct?"]),
+            # Call 5: CoVe answers (NOT FOUND -> fails)
+            _CoVeAnswersResponse(answers=["NOT FOUND"]),
+        ]):
+            results = extract_and_verify(
+                SAMPLE_CONTRACT_TEXT,
+                claude_client=MagicMock(),
+            )
+
+        assert len(results) == 1
+        entry = results[0]
+
+        # Ensemble shows disagreement.
+        assert entry["ensemble"]["agreement"] == "DISAGREED"
+
+        # CoVe was triggered and failed.
+        assert entry["cove"] is not None
+        assert entry["cove"]["cove_passed"] is False
+
+        # Final status.
+        assert entry["status"] == "UNVERIFIED"
+
+    def test_pipeline_with_cove_triggered_passes(self) -> None:
+        """SOLO obligation with successful CoVe -> VERIFIED."""
+        from echelonos.stages.stage_3_extraction import (
+            _CoVeAnswersResponse,
+            _CoVeQuestionsResponse,
+            _ExtractionResponse,
+            _PartyRolesResponse,
+        )
+
+        with _patch_structured_side_effect([
+            # Call 1: party roles
+            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
+            # Call 2: primary extraction (one obligation)
+            _ExtractionResponse(obligations=[SAMPLE_OBLIGATION]),
+            # Call 3: independent extraction (empty -- no match)
+            _ExtractionResponse(obligations=[]),
+            # Call 4: CoVe questions (triggered by SOLO)
             _CoVeQuestionsResponse(
                 questions=[
-                    "What is the frequency of status reports?",
-                    "Who must provide the reports?",
+                    "What must the Vendor deliver?",
+                    "What is the delivery deadline?",
                 ]
             ),
+            # Call 5: CoVe answers (all found -> passes)
             _CoVeAnswersResponse(
                 answers=[
-                    "Quarterly",
-                    "The Vendor",
+                    "All hardware components",
+                    "30 calendar days of the purchase order date",
                 ]
             ),
         ]):
             results = extract_and_verify(
                 SAMPLE_CONTRACT_TEXT,
-                claude_client=mock_claude,
+                claude_client=MagicMock(),
             )
 
         assert len(results) == 1
@@ -449,14 +509,46 @@ class TestFullPipeline:
         # Grounding passes.
         assert entry["grounding"] is True
 
-        # Claude verifies.
-        assert entry["claude_verification"]["verified"] is True
+        # Ensemble shows SOLO.
+        assert entry["ensemble"]["agreement"] == "SOLO"
+        assert entry["ensemble"]["independent_extraction"] is None
 
-        # CoVe was triggered (confidence 0.65 < 0.80) and passed.
+        # CoVe was triggered and passed.
         assert entry["cove"] is not None
         assert entry["cove"]["cove_passed"] is True
-        assert len(entry["cove"]["questions"]) == 2
-        assert len(entry["cove"]["answers"]) == 2
 
         # All checks passed.
         assert entry["status"] == "VERIFIED"
+
+    def test_agreed_but_ungrounded(self) -> None:
+        """Both extractions agree but grounding fails -> UNVERIFIED."""
+        from echelonos.stages.stage_3_extraction import (
+            _ExtractionResponse,
+            _PartyRolesResponse,
+        )
+
+        # Both extractions cite a clause NOT in the document.
+        bad_clause = "The Vendor shall deliver within 7 business days."
+        bad_primary = SAMPLE_OBLIGATION.model_copy(
+            update={"source_clause": bad_clause}
+        )
+        bad_independent = SAMPLE_OBLIGATION_INDEPENDENT.model_copy(
+            update={"source_clause": bad_clause}
+        )
+
+        with _patch_structured_side_effect([
+            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
+            _ExtractionResponse(obligations=[bad_primary]),
+            _ExtractionResponse(obligations=[bad_independent]),
+        ]):
+            results = extract_and_verify(
+                SAMPLE_CONTRACT_TEXT,
+                claude_client=MagicMock(),
+            )
+
+        assert len(results) == 1
+        entry = results[0]
+
+        assert entry["ensemble"]["agreement"] == "AGREED"
+        assert entry["grounding"] is False
+        assert entry["status"] == "UNVERIFIED"

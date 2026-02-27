@@ -11,11 +11,7 @@ class Settings(BaseSettings):
     postgres_user: str = "echelonos"
     postgres_password: str = "echelonos_dev"
 
-    # OpenAI (GPT-4o - extraction)
-    openai_api_key: str = ""
-    openai_model: str = "gpt-4o"
-
-    # Anthropic (Claude - classification & verification)
+    # Anthropic (Claude - extraction & verification)
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-opus-4-6"
 

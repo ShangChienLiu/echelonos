@@ -16,7 +16,6 @@ dependencies = [
     "asyncpg>=0.30",
     "psycopg2-binary>=2.9",
     # LLM Clients
-    "openai>=1.50",
     "anthropic>=0.40",
     # OCR
     "mistralai>=1.0",

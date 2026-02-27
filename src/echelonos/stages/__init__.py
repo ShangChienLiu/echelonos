@@ -13,12 +13,14 @@ from echelonos.stages.stage_2_classification import (
 from echelonos.stages.stage_3_extraction import (
     ExtractionResult,
     Obligation,
+    check_agreement,
     extract_and_verify,
     extract_obligations,
+    extract_obligations_independent,
     extract_party_roles,
+    match_extractions,
     run_cove,
     verify_grounding,
-    verify_with_claude,
 )
 from echelonos.stages.stage_5_amendment import (
     ResolutionResult,

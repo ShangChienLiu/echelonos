@@ -1,17 +1,20 @@
-"""Stage 3: Obligation Extraction + Verification.
+"""Stage 3: Obligation Extraction + Dual Ensemble Verification.
 
 Extracts contractual obligations from raw document text using Claude with
 structured output (tool_use), then verifies each extraction through a
 multi-layer verification pipeline:
 
-1. **Grounding check** -- mechanical substring match of the cited source clause
+1. **Dual independent extraction** -- two separate Claude calls with different
+   prompt framings extract obligations independently.
+2. **Programmatic matching** -- obligations from both runs are paired by
+   source_clause similarity using ``difflib.SequenceMatcher``.
+3. **Agreement check** -- matched pairs are compared on obligation_type,
+   responsible_party, and obligation_text similarity.
+4. **Grounding check** -- mechanical substring match of the cited source clause
    against the original document text.
-2. **Claude cross-verification** -- Claude reviews whether the extracted
-   obligation faithfully represents the source material.
-3. **Chain-of-Verification (CoVe)** -- for low-confidence extractions
-   (confidence < 0.80), Claude generates verification questions, re-reads the
-   document to answer them independently, then compares with the original
-   extraction.
+5. **Chain-of-Verification (CoVe)** -- for DISAGREED or SOLO extractions,
+   Claude generates verification questions, re-reads the document to answer
+   them independently, then compares with the original extraction.
 
 Each obligation is ultimately marked **VERIFIED** or **UNVERIFIED** based on
 the combined results of these checks.
@@ -19,12 +22,11 @@ the combined results of these checks.
 
 from __future__ import annotations
 
-import json
+import difflib
 
 import structlog
 from pydantic import BaseModel
 
-from echelonos.config import settings
 from echelonos.llm.claude_client import extract_with_structured_output, get_anthropic_client
 
 log = structlog.get_logger(__name__)
@@ -122,7 +124,7 @@ def extract_party_roles(
 
 
 # ---------------------------------------------------------------------------
-# Obligation extraction
+# Obligation extraction (primary)
 # ---------------------------------------------------------------------------
 
 _EXTRACTION_SYSTEM_PROMPT = (
@@ -191,6 +193,172 @@ def extract_obligations(
 
 
 # ---------------------------------------------------------------------------
+# Obligation extraction (independent -- different prompt framing)
+# ---------------------------------------------------------------------------
+
+_INDEPENDENT_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a legal contract reviewer. Review the following contract text "
+    "and identify all binding commitments, duties, and requirements imposed "
+    "on either party.\n\n"
+    "For each binding commitment provide:\n"
+    "- obligation_text: a concise summary of the commitment\n"
+    "- obligation_type: classify as one of {types}\n"
+    "- responsible_party: the party who must perform (use the role label)\n"
+    "- counterparty: the party who benefits (use the role label)\n"
+    "- frequency: recurrence schedule if any (or null)\n"
+    "- deadline: due date or timeframe if any (or null)\n"
+    "- source_clause: the EXACT verbatim text from the document that "
+    "creates this commitment -- copy it character-for-character\n"
+    "- source_page: the page number (1-indexed)\n"
+    "- confidence: how certain you are this is a genuine binding commitment "
+    "(0.0-1.0)\n\n"
+    "Known party roles:\n{roles}\n\n"
+    "Return the list of commitments in the specified structured format."
+).format(types=", ".join(OBLIGATION_TYPES), roles="{roles_placeholder}")
+
+
+def extract_obligations_independent(
+    text: str,
+    party_roles: dict[str, str],
+    claude_client=None,
+) -> ExtractionResult:
+    """Independent obligation extraction with a different prompt framing.
+
+    Uses alternative wording ("binding commitments" vs "obligations") to
+    avoid anchoring bias.  Does NOT receive the primary extraction results.
+
+    Parameters
+    ----------
+    text:
+        Raw contract text.
+    party_roles:
+        Previously extracted role-to-entity mapping.
+    claude_client:
+        Optional pre-configured Anthropic client.
+
+    Returns
+    -------
+    ExtractionResult containing the independently extracted obligations.
+    """
+    log.info("extracting_obligations_independent", num_roles=len(party_roles))
+
+    roles_str = "\n".join(f"  {role}: {entity}" for role, entity in party_roles.items())
+    system_prompt = _INDEPENDENT_EXTRACTION_SYSTEM_PROMPT.replace("{roles_placeholder}", roles_str)
+
+    client = claude_client or get_anthropic_client()
+    parsed: _ExtractionResponse = extract_with_structured_output(
+        client=client,
+        system_prompt=system_prompt,
+        user_prompt=text,
+        response_format=_ExtractionResponse,
+    )
+    obligations = parsed.obligations
+
+    log.info("obligations_extracted_independent", count=len(obligations))
+    return ExtractionResult(obligations=obligations, party_roles=party_roles)
+
+
+# ---------------------------------------------------------------------------
+# Matching: pair obligations from both extractions
+# ---------------------------------------------------------------------------
+
+
+def match_extractions(
+    primary: list[Obligation],
+    independent: list[Obligation],
+    threshold: float = 0.7,
+) -> list[tuple[Obligation, Obligation | None]]:
+    """Pair obligations from both extraction runs by source_clause similarity.
+
+    Parameters
+    ----------
+    primary:
+        Obligations from the primary extraction.
+    independent:
+        Obligations from the independent extraction.
+    threshold:
+        Minimum SequenceMatcher ratio to consider a match.
+
+    Returns
+    -------
+    List of (primary_obligation, matched_independent_or_None) tuples,
+    followed by (independent_only, None) tuples marked as SOLO from the
+    independent side (with the independent obligation in position 0 and
+    None in position 1).
+    """
+    used_independent: set[int] = set()
+    pairs: list[tuple[Obligation, Obligation | None]] = []
+
+    for p_obl in primary:
+        best_idx: int | None = None
+        best_ratio = 0.0
+
+        for i, ind_obl in enumerate(independent):
+            if i in used_independent:
+                continue
+            ratio = difflib.SequenceMatcher(
+                None, p_obl.source_clause, ind_obl.source_clause
+            ).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_idx = i
+
+        if best_idx is not None and best_ratio >= threshold:
+            pairs.append((p_obl, independent[best_idx]))
+            used_independent.add(best_idx)
+        else:
+            pairs.append((p_obl, None))
+
+    # Unmatched independent obligations (SOLO from independent side).
+    for i, ind_obl in enumerate(independent):
+        if i not in used_independent:
+            pairs.append((ind_obl, None))
+
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# Agreement check
+# ---------------------------------------------------------------------------
+
+
+def check_agreement(
+    primary: Obligation,
+    independent: Obligation,
+    text_threshold: float = 0.6,
+) -> bool:
+    """Check whether two matched obligations agree.
+
+    Two obligations "agree" if:
+    - Same obligation_type
+    - Same responsible_party
+    - obligation_text similarity (SequenceMatcher ratio) > text_threshold
+
+    Parameters
+    ----------
+    primary:
+        Obligation from the primary extraction.
+    independent:
+        Obligation from the independent extraction.
+    text_threshold:
+        Minimum similarity ratio for obligation_text.
+
+    Returns
+    -------
+    True if the two obligations agree.
+    """
+    if primary.obligation_type != independent.obligation_type:
+        return False
+    if primary.responsible_party != independent.responsible_party:
+        return False
+
+    text_ratio = difflib.SequenceMatcher(
+        None, primary.obligation_text, independent.obligation_text
+    ).ratio()
+    return text_ratio > text_threshold
+
+
+# ---------------------------------------------------------------------------
 # Verification: grounding check
 # ---------------------------------------------------------------------------
 
@@ -216,79 +384,6 @@ def verify_grounding(obligation: Obligation, raw_text: str) -> bool:
         grounded=grounded,
     )
     return grounded
-
-
-# ---------------------------------------------------------------------------
-# Verification: Claude cross-verification
-# ---------------------------------------------------------------------------
-
-
-def verify_with_claude(
-    obligation: Obligation,
-    raw_text: str,
-    anthropic_client=None,
-) -> dict:
-    """Send the obligation to Claude for independent verification.
-
-    Parameters
-    ----------
-    obligation:
-        The obligation to verify.
-    raw_text:
-        The full original document text.
-    anthropic_client:
-        Optional pre-configured Anthropic client.
-
-    Returns
-    -------
-    dict with keys ``verified`` (bool), ``confidence`` (float), ``reason`` (str).
-    """
-    log.info("claude_verification_start", obligation=obligation.obligation_text[:80])
-
-    client = anthropic_client or get_anthropic_client()
-    response = client.messages.create(
-        model=settings.anthropic_model,
-        max_tokens=1024,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "You are verifying an obligation extracted from a contract "
-                    "by another AI.\n\n"
-                    f"Extracted obligation: {obligation.obligation_text}\n"
-                    f"Obligation type: {obligation.obligation_type}\n"
-                    f"Responsible party: {obligation.responsible_party}\n"
-                    f"Counterparty: {obligation.counterparty}\n"
-                    f"Cited source clause: {obligation.source_clause}\n\n"
-                    f"Original document text:\n{raw_text}\n\n"
-                    "Verify:\n"
-                    "1. Does the source clause exist verbatim in the document?\n"
-                    "2. Does the obligation accurately reflect the clause?\n"
-                    "3. Is the obligation type correct?\n\n"
-                    "Respond with JSON only: "
-                    '{"verified": bool, "confidence": float, "reason": str}'
-                ),
-            }
-        ],
-    )
-
-    # Parse Claude's response text as JSON.
-    response_text = response.content[0].text
-    try:
-        result = json.loads(response_text)
-    except json.JSONDecodeError:
-        log.warning(
-            "claude_response_not_json",
-            response_text=response_text[:200],
-        )
-        result = {"verified": False, "confidence": 0.0, "reason": "Failed to parse Claude response"}
-
-    log.info(
-        "claude_verification_complete",
-        verified=result.get("verified"),
-        confidence=result.get("confidence"),
-    )
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -329,9 +424,7 @@ def run_cove(
     raw_text: str,
     claude_client=None,
 ) -> dict:
-    """Run Chain-of-Verification for low-confidence extractions.
-
-    Only intended for obligations with ``confidence < 0.80``.
+    """Run Chain-of-Verification for disputed or solo extractions.
 
     Steps:
         1. Generate verification questions about the obligation.
@@ -413,16 +506,18 @@ def extract_and_verify(
     text: str,
     claude_client=None,
 ) -> list[dict]:
-    """End-to-end obligation extraction and verification pipeline.
+    """End-to-end obligation extraction and dual-ensemble verification pipeline.
 
     Steps:
         1. Extract party roles from the document.
-        2. Extract obligations using Claude structured output.
-        3. For each obligation:
-           a. Grounding check (substring match).
-           b. Claude cross-verification.
-           c. If confidence < 0.80, run Chain-of-Verification.
-        4. Mark each obligation as **VERIFIED** or **UNVERIFIED**.
+        2. Run two independent obligation extractions with different prompts.
+        3. Programmatically match obligations from both extractions.
+        4. For each matched pair:
+           a. Determine agreement status (AGREED / DISAGREED / SOLO).
+           b. Grounding check (substring match).
+           c. For AGREED + grounded → VERIFIED.
+           d. For DISAGREED / SOLO → grounding + CoVe arbitration.
+        5. Mark each obligation as **VERIFIED** or **UNVERIFIED**.
 
     Parameters
     ----------
@@ -436,8 +531,8 @@ def extract_and_verify(
     list of dicts, each containing:
         - obligation: the Obligation model dict
         - grounding: bool
-        - claude_verification: dict with verified/confidence/reason
-        - cove: dict or None (only present if confidence < 0.80)
+        - ensemble: dict with agreement/primary_extraction/independent_extraction
+        - cove: dict or None (only for DISAGREED/SOLO)
         - status: "VERIFIED" or "UNVERIFIED"
     """
     log.info("pipeline_start", text_length=len(text))
@@ -445,46 +540,66 @@ def extract_and_verify(
     # Step 1: Extract party roles.
     party_roles = extract_party_roles(text, claude_client=claude_client)
 
-    # Step 2: Extract obligations.
-    extraction = extract_obligations(
+    # Step 2: Run both extractions independently.
+    primary_extraction = extract_obligations(
         text, party_roles, claude_client=claude_client
+    )
+    independent_extraction = extract_obligations_independent(
+        text, party_roles, claude_client=claude_client
+    )
+
+    # Step 3: Match obligations from both extractions.
+    pairs = match_extractions(
+        primary_extraction.obligations,
+        independent_extraction.obligations,
     )
 
     results: list[dict] = []
 
-    for obligation in extraction.obligations:
+    for primary_obl, independent_obl in pairs:
         log.info(
             "verifying_obligation",
-            obligation=obligation.obligation_text[:80],
-            confidence=obligation.confidence,
+            obligation=primary_obl.obligation_text[:80],
+            has_match=independent_obl is not None,
         )
 
-        # Step 3a: Grounding check.
-        grounded = verify_grounding(obligation, text)
+        # Determine agreement status.
+        if independent_obl is None:
+            agreement = "SOLO"
+        elif check_agreement(primary_obl, independent_obl):
+            agreement = "AGREED"
+        else:
+            agreement = "DISAGREED"
 
-        # Step 3b: Claude cross-verification.
-        claude_result = verify_with_claude(
-            obligation, text, anthropic_client=claude_client
-        )
+        # Grounding check (always on primary obligation).
+        grounded = verify_grounding(primary_obl, text)
 
-        # Step 3c: CoVe for low-confidence extractions.
+        # CoVe arbitration for DISAGREED / SOLO.
         cove_result = None
-        if obligation.confidence < 0.80:
-            cove_result = run_cove(obligation, text, claude_client=claude_client)
+        if agreement in ("DISAGREED", "SOLO"):
+            cove_result = run_cove(primary_obl, text, claude_client=claude_client)
 
         # Determine final status.
-        claude_verified = claude_result.get("verified", False)
-        cove_ok = cove_result is None or cove_result.get("cove_passed", False)
-
-        if grounded and claude_verified and cove_ok:
+        if agreement == "AGREED" and grounded:
             status = "VERIFIED"
+        elif agreement in ("DISAGREED", "SOLO"):
+            cove_ok = cove_result is not None and cove_result.get("cove_passed", False)
+            if grounded and cove_ok:
+                status = "VERIFIED"
+            else:
+                status = "UNVERIFIED"
         else:
+            # AGREED but not grounded
             status = "UNVERIFIED"
 
         entry = {
-            "obligation": obligation.model_dump(),
+            "obligation": primary_obl.model_dump(),
             "grounding": grounded,
-            "claude_verification": claude_result,
+            "ensemble": {
+                "agreement": agreement,
+                "primary_extraction": primary_obl.model_dump(),
+                "independent_extraction": independent_obl.model_dump() if independent_obl else None,
+            },
             "cove": cove_result,
             "status": status,
         }
@@ -492,10 +607,10 @@ def extract_and_verify(
 
         log.info(
             "obligation_verified",
-            obligation=obligation.obligation_text[:80],
+            obligation=primary_obl.obligation_text[:80],
             status=status,
             grounded=grounded,
-            claude_verified=claude_verified,
+            agreement=agreement,
             cove_passed=cove_result.get("cove_passed") if cove_result else None,
         )
 

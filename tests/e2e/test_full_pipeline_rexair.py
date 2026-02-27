@@ -2,8 +2,8 @@
 
 Creates one minimal file of each supported type (PDF, DOCX, HTML, XLSX,
 PNG, JPG, ZIP) inside a temporary org folder and runs every stage of the
-pipeline end-to-end with mocked external services (Mistral OCR, Claude,
-OpenAI).  Each test class covers a different file format category.
+pipeline end-to-end with mocked external services (Mistral OCR, Claude).
+Each test class covers a different file format category.
 
 When a stage fails, the test report captures the exact stage, file type,
 and error so the root cause is immediately visible.
