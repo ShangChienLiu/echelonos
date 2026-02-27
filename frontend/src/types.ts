@@ -1,0 +1,41 @@
+export interface ObligationRow {
+  number: number;
+  obligation_text: string;
+  obligation_type: string;
+  responsible_party: string;
+  counterparty: string;
+  source: string;
+  status: 'ACTIVE' | 'SUPERSEDED' | 'TERMINATED' | 'UNRESOLVED';
+  frequency: string | null;
+  deadline: string | null;
+  confidence: number;
+  source_clause?: string;
+  source_page?: number;
+  doc_filename?: string;
+}
+
+export interface FlagItem {
+  flag_type: string;
+  severity: 'RED' | 'ORANGE' | 'YELLOW' | 'WHITE';
+  entity_type: string;
+  entity_id: string;
+  message: string;
+}
+
+export interface SummaryData {
+  by_type: Record<string, number>;
+  by_status: Record<string, number>;
+  by_responsible_party: Record<string, number>;
+}
+
+export interface ObligationReport {
+  org_name: string;
+  generated_at: string;
+  total_obligations: number;
+  active_obligations: number;
+  superseded_obligations: number;
+  unresolved_obligations: number;
+  obligations: ObligationRow[];
+  flags: FlagItem[];
+  summary: SummaryData;
+}

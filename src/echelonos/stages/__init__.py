@@ -20,3 +20,30 @@ from echelonos.stages.stage_3_extraction import (
     verify_grounding,
     verify_with_claude,
 )
+from echelonos.stages.stage_5_amendment import (
+    ResolutionResult,
+    build_amendment_chain,
+    compare_clauses,
+    resolve_all,
+    resolve_amendment_chain,
+    resolve_obligation,
+)
+from echelonos.stages.stage_6_evidence import (
+    EvidenceRecord,
+    VerificationResult,
+    create_evidence_record,
+    create_status_change_record,
+    package_evidence,
+    validate_evidence_chain,
+)
+from echelonos.stages.stage_7_report import (
+    FlagItem,
+    ObligationReport,
+    ObligationRow,
+    build_flag_report,
+    build_obligation_matrix,
+    build_summary,
+    export_to_json,
+    export_to_markdown,
+    generate_report,
+)

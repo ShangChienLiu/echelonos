@@ -34,6 +34,9 @@ dependencies = [
     # Utilities
     "structlog>=24.0",
     "tenacity>=9.0",
+    # API
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
 ]
 
 [project.optional-dependencies]
