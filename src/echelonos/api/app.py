@@ -148,7 +148,11 @@ def _get_real_report(org_name: str, db: Session) -> ObligationReport | None:
             "child_doc_id": str(link.child_doc_id),
             "parent_doc_id": str(link.parent_doc_id) if link.parent_doc_id else None,
             "status": link.link_status,
-            "confidence": (link.candidates or {}).get("confidence", 0.0),
+            "confidence": (
+                link.candidates.get("confidence", 0.0)
+                if isinstance(link.candidates, dict)
+                else 0.0
+            ),
         })
 
     # Query Evidence table for amendment_history and merge into obligations.

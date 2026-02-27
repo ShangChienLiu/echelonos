@@ -67,6 +67,9 @@ class ObligationRow(BaseModel):
     frequency: str | None = None
     deadline: str | None = None
     confidence: float
+    source_clause: str | None = None
+    source_page: int | None = None
+    doc_filename: str | None = None
     amendment_history: list[dict] | None = None
 
 
@@ -227,6 +230,10 @@ def build_obligation_matrix(
     rows: list[ObligationRow] = []
     for obl in obligations:
         source = _format_source(obl, documents, links)
+        # Resolve doc_filename from documents lookup.
+        doc_id = obl.get("doc_id", "")
+        doc = documents.get(str(doc_id), {})
+        doc_filename = doc.get("filename")
         row = ObligationRow(
             number=0,  # placeholder; numbered after sorting
             obligation_text=obl.get("obligation_text", ""),
@@ -238,6 +245,9 @@ def build_obligation_matrix(
             frequency=obl.get("frequency"),
             deadline=obl.get("deadline"),
             confidence=obl.get("confidence", 0.0),
+            source_clause=obl.get("source_clause"),
+            source_page=obl.get("source_page"),
+            doc_filename=doc_filename,
             amendment_history=obl.get("amendment_history"),
         )
         rows.append(row)
