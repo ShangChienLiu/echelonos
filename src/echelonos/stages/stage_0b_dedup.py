@@ -2,7 +2,7 @@
 
 Layer 1 - File Hash (SHA-256): Hash raw bytes to catch exact copies.
 Layer 2 - Content Hash: Extract text, normalize, hash to catch format variants.
-Layer 3 - SimHash (64-bit): Fingerprint comparison with Hamming distance <= 3 for near-duplicates.
+Layer 3 - SimHash (64-bit): Fingerprint comparison with Hamming distance <= 1 for near-duplicates.
 Layer 4 - Structural Fingerprint: Hash of (doc_type + date + parties) protects amendments/SOWs.
 """
 
@@ -157,7 +157,8 @@ def compute_structural_fingerprint(
 # Main deduplication entry point
 # ---------------------------------------------------------------------------
 
-SIMHASH_THRESHOLD = 3  # Maximum Hamming distance to consider near-duplicate
+SIMHASH_THRESHOLD = 1  # Maximum Hamming distance to consider near-duplicate
+MIN_TEXT_LENGTH = 50  # Minimum chars of extracted text to run Layer 2/3
 
 
 def deduplicate_files(files: list[dict]) -> list[dict]:
@@ -196,7 +197,7 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
         entry["file_hash"] = file_hash
 
         text = extract_text(fp)
-        has_text = bool(text.strip())
+        has_text = len(text.strip()) >= MIN_TEXT_LENGTH
         content_hash = compute_content_hash(text)
         entry["content_hash"] = content_hash
 

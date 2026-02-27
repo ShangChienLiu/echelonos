@@ -181,37 +181,44 @@ class TestContentDuplicateDetected:
 
 
 class TestNearDuplicateDetected:
-    """Layer 3: Files with minor text differences should be flagged via SimHash."""
+    """Layer 3: Files that differ by at most 1 bit of SimHash should be flagged."""
 
     def test_near_duplicate_detected(self, tmp_path: Path):
+        """Same document with word-order swap (e.g. OCR artefact) should be
+        caught by Layer 3 at SimHash distance 0.
+
+        We need content that differs at byte level (Layer 1) AND
+        normalized-text level (Layer 2) so Layer 3 is exercised.
+        """
         base_text = (
             "This Master Services Agreement is entered into by and between "
             "Acme Corporation and Widget Incorporated effective January 15 2024. "
             "The parties agree to the following terms and conditions for the "
             "provision of consulting services as described herein."
         )
-        # Minor edit: change one word and add a typo
-        edited_text = (
+        # Swap two words: "Acme Corporation" -> "Corporation Acme"
+        # SimHash uses bag-of-words so this is distance 0
+        variant_text = (
             "This Master Services Agreement is entered into by and between "
-            "Acme Corporation and Widget Incorporated effective January 15 2024. "
+            "Corporation Acme and Widget Incorporated effective January 15 2024. "
             "The parties agree to the following terms and conditions for the "
-            "provision of advisory services as described herein."
+            "provision of consulting services as described herein."
         )
 
         pdf_a = _make_pdf(tmp_path / "original.pdf", base_text)
-        pdf_b = _make_pdf(tmp_path / "edited.pdf", edited_text)
+        pdf_b = _make_pdf(tmp_path / "variant.pdf", variant_text)
 
-        # Verify they are NOT exact or content-hash duplicates
+        # Verify they are NOT caught by Layer 1 or Layer 2
         assert compute_file_hash(str(pdf_a)) != compute_file_hash(str(pdf_b))
         text_a = extract_text(str(pdf_a))
         text_b = extract_text(str(pdf_b))
         assert compute_content_hash(text_a) != compute_content_hash(text_b)
 
-        # But SimHash distance should be small
+        # SimHash distance should be 0 or 1
         sh_a = compute_simhash(text_a)
         sh_b = compute_simhash(text_b)
-        assert hamming_distance(sh_a, sh_b) <= 3, (
-            f"Expected hamming distance <= 3, got {hamming_distance(sh_a, sh_b)}"
+        assert hamming_distance(sh_a, sh_b) <= 1, (
+            f"Expected hamming distance <= 1, got {hamming_distance(sh_a, sh_b)}"
         )
 
         files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
@@ -222,6 +229,39 @@ class TestNearDuplicateDetected:
         dup = files[1]
         assert dup["is_duplicate"] is True
         assert dup["dedup_layer"] == 3
+
+    def test_one_word_change_not_flagged(self, tmp_path: Path):
+        """Changing even one substantive word should NOT be flagged at
+        threshold=1, because legal contracts share boilerplate that makes
+        SimHash distance artificially small at k>1."""
+        base_text = (
+            "This Master Services Agreement is entered into by and between "
+            "Acme Corporation and Widget Incorporated effective January 15 2024. "
+            "The parties agree to the following terms and conditions for the "
+            "provision of consulting services as described herein."
+        )
+        edited_text = (
+            "This Master Services Agreement is entered into by and between "
+            "Acme Corporation and Widget Incorporated effective January 15 2024. "
+            "The parties agree to the following terms and conditions for the "
+            "provision of advisory services as described herein."
+        )
+
+        pdf_a = _make_pdf(tmp_path / "consulting.pdf", base_text)
+        pdf_b = _make_pdf(tmp_path / "advisory.pdf", edited_text)
+
+        text_a = extract_text(str(pdf_a))
+        text_b = extract_text(str(pdf_b))
+        sh_a = compute_simhash(text_a)
+        sh_b = compute_simhash(text_b)
+        dist = hamming_distance(sh_a, sh_b)
+        assert dist > 1, f"Test setup: expected distance > 1, got {dist}"
+
+        files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+        unique = deduplicate_files(files)
+
+        # Both should survive — substantive difference
+        assert len(unique) == 2
 
 
 class TestAmendmentNotFlagged:
@@ -314,6 +354,79 @@ class TestScannedPdfsNotDeduplicated:
         result = deduplicate_files(files)
         # All 3 have different bytes — should be unique
         assert len(result) == 3, f"Expected 3 unique, got {len(result)}"
+
+
+class TestSimhashThresholdRejectsDistantPairs:
+    """Layer 3 should NOT flag documents at Hamming distance > 1.
+
+    Legal contracts share boilerplate language that produces artificially
+    similar SimHash fingerprints.  At threshold k=3, many unrelated
+    contracts are falsely collapsed.  The threshold should be k=1 so only
+    truly near-identical documents are flagged.
+    """
+
+    def test_different_contracts_at_distance_2_not_flagged(self, tmp_path: Path):
+        """Two contracts sharing boilerplate but with a substantive word
+        change should NOT be flagged.  This pair produces SimHash distance 2,
+        which would be a false positive at the old threshold of k=3.
+        """
+        contract_a = (
+            "This Master Services Agreement is entered into by and between "
+            "Acme Corporation and Widget Incorporated effective January 15 2024. "
+            "The parties agree to the following terms and conditions for the "
+            "provision of consulting services as described herein."
+        )
+        # Change one word: "consulting" -> "advisory", producing distance ~2
+        contract_b = (
+            "This Master Services Agreement is entered into by and between "
+            "Acme Corporation and Widget Incorporated effective January 15 2024. "
+            "The parties agree to the following terms and conditions for the "
+            "provision of advisory services as described herein."
+        )
+
+        pdf_a = _make_pdf(tmp_path / "consulting_msa.pdf", contract_a)
+        pdf_b = _make_pdf(tmp_path / "advisory_msa.pdf", contract_b)
+
+        text_a = extract_text(str(pdf_a))
+        text_b = extract_text(str(pdf_b))
+        assert compute_content_hash(text_a) != compute_content_hash(text_b)
+
+        sh_a = compute_simhash(text_a)
+        sh_b = compute_simhash(text_b)
+        dist = hamming_distance(sh_a, sh_b)
+        assert dist > 1, (
+            f"Test setup error: expected hamming distance > 1, got {dist}"
+        )
+
+        files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+        unique = deduplicate_files(files)
+
+        # Both should be kept — they are different contracts
+        assert len(unique) == 2, (
+            f"Expected 2 unique, got {len(unique)}; "
+            f"SimHash distance was {dist}"
+        )
+
+
+class TestMinimalTextSkipsContentLayers:
+    """Files with very little extractable text (e.g. a single period from
+    a scanned PDF) should skip Layer 2/3 to avoid false collapses.
+    """
+
+    def test_near_empty_text_not_deduplicated(self, tmp_path: Path):
+        """Two PDFs with real text content that is very short (< 50 chars)
+        should not be collapsed by Layer 2/3 even if their normalized text
+        happens to be similar.
+        """
+        # Simulate scanned PDFs where OCR extracts only a few garbage chars
+        pdf_a = _make_pdf(tmp_path / "scan_a.pdf", ".")
+        pdf_b = _make_pdf(tmp_path / "scan_b.pdf", ",")
+
+        files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+        unique = deduplicate_files(files)
+
+        # Both should survive — too little text for reliable content comparison
+        assert len(unique) == 2, f"Expected 2 unique, got {len(unique)}"
 
 
 class TestEmptyInput:
