@@ -1,15 +1,15 @@
-"""Stage 3: Obligation Extraction + Verification (Dual-LLM).
+"""Stage 3: Obligation Extraction + Verification.
 
-Extracts contractual obligations from raw document text using GPT-4o with
-structured output, then verifies each extraction through a multi-layer
-verification pipeline:
+Extracts contractual obligations from raw document text using Claude with
+structured output (tool_use), then verifies each extraction through a
+multi-layer verification pipeline:
 
 1. **Grounding check** -- mechanical substring match of the cited source clause
    against the original document text.
-2. **Claude cross-verification** -- an independent LLM (Claude) reviews whether
-   the extracted obligation faithfully represents the source material.
+2. **Claude cross-verification** -- Claude reviews whether the extracted
+   obligation faithfully represents the source material.
 3. **Chain-of-Verification (CoVe)** -- for low-confidence extractions
-   (confidence < 0.80), GPT-4o generates verification questions, re-reads the
+   (confidence < 0.80), Claude generates verification questions, re-reads the
    document to answer them independently, then compares with the original
    extraction.
 
@@ -25,8 +25,7 @@ import structlog
 from pydantic import BaseModel
 
 from echelonos.config import settings
-from echelonos.llm.claude_client import get_anthropic_client
-from echelonos.llm.openai_client import get_openai_client
+from echelonos.llm.claude_client import extract_with_structured_output, get_anthropic_client
 
 log = structlog.get_logger(__name__)
 
@@ -92,16 +91,16 @@ class _PartyRolesResponse(BaseModel):
 
 def extract_party_roles(
     text: str,
-    openai_client=None,
+    claude_client=None,
 ) -> dict[str, str]:
-    """Extract party-role mappings from contract text using GPT-4o.
+    """Extract party-role mappings from contract text using Claude.
 
     Parameters
     ----------
     text:
         Raw contract text.
-    openai_client:
-        Optional pre-configured OpenAI client (useful for testing).
+    claude_client:
+        Optional pre-configured Anthropic client (useful for testing).
 
     Returns
     -------
@@ -109,16 +108,13 @@ def extract_party_roles(
     """
     log.info("extracting_party_roles")
 
-    client = openai_client or get_openai_client()
-    result = client.beta.chat.completions.parse(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": _PARTY_ROLES_SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
+    client = claude_client or get_anthropic_client()
+    parsed: _PartyRolesResponse = extract_with_structured_output(
+        client=client,
+        system_prompt=_PARTY_ROLES_SYSTEM_PROMPT,
+        user_prompt=text,
         response_format=_PartyRolesResponse,
     )
-    parsed: _PartyRolesResponse = result.choices[0].message.parsed
     party_roles = parsed.party_roles
 
     log.info("party_roles_extracted", roles=party_roles)
@@ -159,9 +155,9 @@ class _ExtractionResponse(BaseModel):
 def extract_obligations(
     text: str,
     party_roles: dict[str, str],
-    openai_client=None,
+    claude_client=None,
 ) -> ExtractionResult:
-    """Extract obligations from contract text using GPT-4o structured output.
+    """Extract obligations from contract text using Claude structured output.
 
     Parameters
     ----------
@@ -169,8 +165,8 @@ def extract_obligations(
         Raw contract text.
     party_roles:
         Previously extracted role-to-entity mapping.
-    openai_client:
-        Optional pre-configured OpenAI client.
+    claude_client:
+        Optional pre-configured Anthropic client.
 
     Returns
     -------
@@ -181,16 +177,13 @@ def extract_obligations(
     roles_str = "\n".join(f"  {role}: {entity}" for role, entity in party_roles.items())
     system_prompt = _EXTRACTION_SYSTEM_PROMPT.replace("{roles_placeholder}", roles_str)
 
-    client = openai_client or get_openai_client()
-    result = client.beta.chat.completions.parse(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text},
-        ],
+    client = claude_client or get_anthropic_client()
+    parsed: _ExtractionResponse = extract_with_structured_output(
+        client=client,
+        system_prompt=system_prompt,
+        user_prompt=text,
         response_format=_ExtractionResponse,
     )
-    parsed: _ExtractionResponse = result.choices[0].message.parsed
     obligations = parsed.obligations
 
     log.info("obligations_extracted", count=len(obligations))
@@ -334,7 +327,7 @@ class _CoVeAnswersResponse(BaseModel):
 def run_cove(
     obligation: Obligation,
     raw_text: str,
-    openai_client=None,
+    claude_client=None,
 ) -> dict:
     """Run Chain-of-Verification for low-confidence extractions.
 
@@ -351,8 +344,8 @@ def run_cove(
         The obligation to verify via CoVe.
     raw_text:
         The full original document text.
-    openai_client:
-        Optional pre-configured OpenAI client.
+    claude_client:
+        Optional pre-configured Anthropic client.
 
     Returns
     -------
@@ -360,7 +353,7 @@ def run_cove(
     """
     log.info("cove_start", obligation=obligation.obligation_text[:80])
 
-    client = openai_client or get_openai_client()
+    client = claude_client or get_anthropic_client()
 
     # Step 1: Generate verification questions.
     questions_user_prompt = (
@@ -371,15 +364,12 @@ def run_cove(
         f"Source clause: {obligation.source_clause}\n"
     )
 
-    questions_result = client.beta.chat.completions.parse(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": _COVE_QUESTIONS_SYSTEM_PROMPT},
-            {"role": "user", "content": questions_user_prompt},
-        ],
+    questions_parsed: _CoVeQuestionsResponse = extract_with_structured_output(
+        client=client,
+        system_prompt=_COVE_QUESTIONS_SYSTEM_PROMPT,
+        user_prompt=questions_user_prompt,
         response_format=_CoVeQuestionsResponse,
     )
-    questions_parsed: _CoVeQuestionsResponse = questions_result.choices[0].message.parsed
     questions = questions_parsed.questions
 
     # Step 2: Re-read document to answer questions independently.
@@ -388,15 +378,12 @@ def run_cove(
         f"Questions:\n" + "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
     )
 
-    answers_result = client.beta.chat.completions.parse(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": _COVE_ANSWERS_SYSTEM_PROMPT},
-            {"role": "user", "content": answers_user_prompt},
-        ],
+    answers_parsed: _CoVeAnswersResponse = extract_with_structured_output(
+        client=client,
+        system_prompt=_COVE_ANSWERS_SYSTEM_PROMPT,
+        user_prompt=answers_user_prompt,
         response_format=_CoVeAnswersResponse,
     )
-    answers_parsed: _CoVeAnswersResponse = answers_result.choices[0].message.parsed
     answers = answers_parsed.answers
 
     # Step 3: Compare -- if any answer is "NOT FOUND" or contradicts the
@@ -424,14 +411,13 @@ def run_cove(
 
 def extract_and_verify(
     text: str,
-    openai_client=None,
-    anthropic_client=None,
+    claude_client=None,
 ) -> list[dict]:
     """End-to-end obligation extraction and verification pipeline.
 
     Steps:
         1. Extract party roles from the document.
-        2. Extract obligations using GPT-4o structured output.
+        2. Extract obligations using Claude structured output.
         3. For each obligation:
            a. Grounding check (substring match).
            b. Claude cross-verification.
@@ -442,9 +428,7 @@ def extract_and_verify(
     ----------
     text:
         Raw contract document text.
-    openai_client:
-        Optional pre-configured OpenAI client.
-    anthropic_client:
+    claude_client:
         Optional pre-configured Anthropic client.
 
     Returns
@@ -459,11 +443,11 @@ def extract_and_verify(
     log.info("pipeline_start", text_length=len(text))
 
     # Step 1: Extract party roles.
-    party_roles = extract_party_roles(text, openai_client=openai_client)
+    party_roles = extract_party_roles(text, claude_client=claude_client)
 
     # Step 2: Extract obligations.
     extraction = extract_obligations(
-        text, party_roles, openai_client=openai_client
+        text, party_roles, claude_client=claude_client
     )
 
     results: list[dict] = []
@@ -480,13 +464,13 @@ def extract_and_verify(
 
         # Step 3b: Claude cross-verification.
         claude_result = verify_with_claude(
-            obligation, text, anthropic_client=anthropic_client
+            obligation, text, anthropic_client=claude_client
         )
 
         # Step 3c: CoVe for low-confidence extractions.
         cove_result = None
         if obligation.confidence < 0.80:
-            cove_result = run_cove(obligation, text, openai_client=openai_client)
+            cove_result = run_cove(obligation, text, claude_client=claude_client)
 
         # Determine final status.
         claude_verified = claude_result.get("verified", False)

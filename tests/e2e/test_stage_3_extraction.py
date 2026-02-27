@@ -1,8 +1,7 @@
-"""E2E tests for Stage 3: Obligation Extraction + Verification (Dual-LLM).
+"""E2E tests for Stage 3: Obligation Extraction + Verification.
 
-All LLM calls (OpenAI and Anthropic) are mocked to enable deterministic
-testing without API keys or network access.  Mock responses are designed
-to be realistic representations of actual LLM output.
+All LLM calls (Claude structured output and Claude verification) are mocked
+to enable deterministic testing without API keys or network access.
 """
 
 from __future__ import annotations
@@ -88,24 +87,26 @@ SAMPLE_LOW_CONFIDENCE_OBLIGATION = Obligation(
 )
 
 
-def _make_openai_parse_response(parsed_obj):
-    """Build a mock OpenAI structured-output response."""
-    message = SimpleNamespace(parsed=parsed_obj)
-    choice = SimpleNamespace(message=message)
-    return SimpleNamespace(choices=[choice])
+def _patch_structured(return_value):
+    """Patch extract_with_structured_output in stage_3_extraction."""
+    return patch(
+        "echelonos.stages.stage_3_extraction.extract_with_structured_output",
+        return_value=return_value,
+    )
+
+
+def _patch_structured_side_effect(side_effect):
+    """Patch extract_with_structured_output with multiple return values."""
+    return patch(
+        "echelonos.stages.stage_3_extraction.extract_with_structured_output",
+        side_effect=side_effect,
+    )
 
 
 def _make_anthropic_response(text: str):
     """Build a mock Anthropic messages.create response."""
     content_block = SimpleNamespace(text=text)
     return SimpleNamespace(content=[content_block])
-
-
-def _mock_openai_client():
-    """Return a MagicMock that behaves like an OpenAI client."""
-    client = MagicMock()
-    client.beta.chat.completions.parse = MagicMock()
-    return client
 
 
 def _mock_anthropic_client():
@@ -127,21 +128,14 @@ class TestExtractPartyRoles:
         """Correct role mapping is extracted from contract text."""
         from echelonos.stages.stage_3_extraction import _PartyRolesResponse
 
-        mock_client = _mock_openai_client()
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_openai_parse_response(
-                _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES)
-            )
-        )
+        expected = _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES)
 
-        roles = extract_party_roles(SAMPLE_CONTRACT_TEXT, openai_client=mock_client)
+        with _patch_structured(expected):
+            roles = extract_party_roles(SAMPLE_CONTRACT_TEXT, claude_client=MagicMock())
 
         assert roles == SAMPLE_PARTY_ROLES
         assert roles["Vendor"] == "CDW Government LLC"
         assert roles["Client"] == "State of California"
-
-        # Verify the client was called exactly once.
-        mock_client.beta.chat.completions.parse.assert_called_once()
 
 
 class TestExtractObligations:
@@ -152,19 +146,14 @@ class TestExtractObligations:
         from echelonos.stages.stage_3_extraction import _ExtractionResponse
 
         obligations = [SAMPLE_OBLIGATION, SAMPLE_LOW_CONFIDENCE_OBLIGATION]
+        expected = _ExtractionResponse(obligations=obligations)
 
-        mock_client = _mock_openai_client()
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_openai_parse_response(
-                _ExtractionResponse(obligations=obligations)
+        with _patch_structured(expected):
+            result = extract_obligations(
+                SAMPLE_CONTRACT_TEXT,
+                SAMPLE_PARTY_ROLES,
+                claude_client=MagicMock(),
             )
-        )
-
-        result = extract_obligations(
-            SAMPLE_CONTRACT_TEXT,
-            SAMPLE_PARTY_ROLES,
-            openai_client=mock_client,
-        )
 
         assert isinstance(result, ExtractionResult)
         assert len(result.obligations) == 2
@@ -268,8 +257,6 @@ class TestCoVe:
             _CoVeQuestionsResponse,
         )
 
-        mock_client = _mock_openai_client()
-
         questions = [
             "What is the frequency of the status reports?",
             "Who is responsible for providing the status reports?",
@@ -281,26 +268,19 @@ class TestCoVe:
             "Delivery timelines and any anticipated delays",
         ]
 
-        # First call: generate questions. Second call: answer questions.
-        mock_client.beta.chat.completions.parse.side_effect = [
-            _make_openai_parse_response(
-                _CoVeQuestionsResponse(questions=questions)
-            ),
-            _make_openai_parse_response(
-                _CoVeAnswersResponse(answers=answers)
-            ),
-        ]
-
-        result = run_cove(
-            SAMPLE_LOW_CONFIDENCE_OBLIGATION,
-            SAMPLE_CONTRACT_TEXT,
-            openai_client=mock_client,
-        )
+        with _patch_structured_side_effect([
+            _CoVeQuestionsResponse(questions=questions),
+            _CoVeAnswersResponse(answers=answers),
+        ]):
+            result = run_cove(
+                SAMPLE_LOW_CONFIDENCE_OBLIGATION,
+                SAMPLE_CONTRACT_TEXT,
+                claude_client=MagicMock(),
+            )
 
         assert result["cove_passed"] is True
         assert len(result["questions"]) == 3
         assert len(result["answers"]) == 3
-        assert mock_client.beta.chat.completions.parse.call_count == 2
 
     def test_cove_skipped_for_high_confidence(self) -> None:
         """CoVe is not triggered when confidence >= 0.80.
@@ -314,39 +294,24 @@ class TestCoVe:
             _PartyRolesResponse,
         )
 
-        mock_openai = _mock_openai_client()
-        mock_anthropic = _mock_anthropic_client()
-
-        # Party roles response.
-        party_roles_resp = _make_openai_parse_response(
-            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES)
-        )
-        # Extraction response with a high-confidence obligation.
-        extraction_resp = _make_openai_parse_response(
-            _ExtractionResponse(obligations=[SAMPLE_OBLIGATION])
-        )
-
-        mock_openai.beta.chat.completions.parse.side_effect = [
-            party_roles_resp,
-            extraction_resp,
-            # No CoVe calls expected.
-        ]
-
-        mock_anthropic.messages.create.return_value = _make_anthropic_response(
+        mock_claude = MagicMock()
+        mock_claude.messages.create.return_value = _make_anthropic_response(
             '{"verified": true, "confidence": 0.95, "reason": "Verified."}'
         )
 
-        results = extract_and_verify(
-            SAMPLE_CONTRACT_TEXT,
-            openai_client=mock_openai,
-            anthropic_client=mock_anthropic,
-        )
+        with _patch_structured_side_effect([
+            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
+            _ExtractionResponse(obligations=[SAMPLE_OBLIGATION]),
+            # No CoVe calls expected.
+        ]):
+            results = extract_and_verify(
+                SAMPLE_CONTRACT_TEXT,
+                claude_client=mock_claude,
+            )
 
         assert len(results) == 1
         # CoVe should be None because confidence (0.95) >= 0.80.
         assert results[0]["cove"] is None
-        # OpenAI was called only for party roles + extraction (2 calls), NOT CoVe.
-        assert mock_openai.beta.chat.completions.parse.call_count == 2
 
 
 class TestFullPipeline:
@@ -359,34 +324,21 @@ class TestFullPipeline:
             _PartyRolesResponse,
         )
 
-        mock_openai = _mock_openai_client()
-        mock_anthropic = _mock_anthropic_client()
-
-        # Party roles response.
-        party_roles_resp = _make_openai_parse_response(
-            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES)
-        )
-        # Extraction response.
-        extraction_resp = _make_openai_parse_response(
-            _ExtractionResponse(obligations=[SAMPLE_OBLIGATION])
-        )
-
-        mock_openai.beta.chat.completions.parse.side_effect = [
-            party_roles_resp,
-            extraction_resp,
-        ]
-
-        # Claude agrees.
-        mock_anthropic.messages.create.return_value = _make_anthropic_response(
+        mock_claude = MagicMock()
+        # Claude verification agrees.
+        mock_claude.messages.create.return_value = _make_anthropic_response(
             '{"verified": true, "confidence": 0.92, '
             '"reason": "The obligation is accurately extracted."}'
         )
 
-        results = extract_and_verify(
-            SAMPLE_CONTRACT_TEXT,
-            openai_client=mock_openai,
-            anthropic_client=mock_anthropic,
-        )
+        with _patch_structured_side_effect([
+            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
+            _ExtractionResponse(obligations=[SAMPLE_OBLIGATION]),
+        ]):
+            results = extract_and_verify(
+                SAMPLE_CONTRACT_TEXT,
+                claude_client=mock_claude,
+            )
 
         assert len(results) == 1
         entry = results[0]
@@ -427,33 +379,21 @@ class TestFullPipeline:
             confidence=0.85,
         )
 
-        mock_openai = _mock_openai_client()
-        mock_anthropic = _mock_anthropic_client()
-
-        party_roles_resp = _make_openai_parse_response(
-            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES)
-        )
-        extraction_resp = _make_openai_parse_response(
-            _ExtractionResponse(obligations=[bad_obligation])
-        )
-
-        mock_openai.beta.chat.completions.parse.side_effect = [
-            party_roles_resp,
-            extraction_resp,
-        ]
-
-        # Claude also disagrees.
-        mock_anthropic.messages.create.return_value = _make_anthropic_response(
+        mock_claude = MagicMock()
+        mock_claude.messages.create.return_value = _make_anthropic_response(
             '{"verified": false, "confidence": 0.20, '
             '"reason": "The source clause does not exist in the document. '
             'The actual delivery term is 30 calendar days, not 7 business days."}'
         )
 
-        results = extract_and_verify(
-            SAMPLE_CONTRACT_TEXT,
-            openai_client=mock_openai,
-            anthropic_client=mock_anthropic,
-        )
+        with _patch_structured_side_effect([
+            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
+            _ExtractionResponse(obligations=[bad_obligation]),
+        ]):
+            results = extract_and_verify(
+                SAMPLE_CONTRACT_TEXT,
+                claude_client=mock_claude,
+            )
 
         assert len(results) == 1
         entry = results[0]
@@ -476,49 +416,32 @@ class TestFullPipeline:
             _PartyRolesResponse,
         )
 
-        mock_openai = _mock_openai_client()
-        mock_anthropic = _mock_anthropic_client()
+        mock_claude = MagicMock()
+        mock_claude.messages.create.return_value = _make_anthropic_response(
+            '{"verified": true, "confidence": 0.88, '
+            '"reason": "Obligation matches the source clause."}'
+        )
 
-        party_roles_resp = _make_openai_parse_response(
-            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES)
-        )
-        extraction_resp = _make_openai_parse_response(
-            _ExtractionResponse(obligations=[SAMPLE_LOW_CONFIDENCE_OBLIGATION])
-        )
-        questions_resp = _make_openai_parse_response(
+        with _patch_structured_side_effect([
+            _PartyRolesResponse(party_roles=SAMPLE_PARTY_ROLES),
+            _ExtractionResponse(obligations=[SAMPLE_LOW_CONFIDENCE_OBLIGATION]),
             _CoVeQuestionsResponse(
                 questions=[
                     "What is the frequency of status reports?",
                     "Who must provide the reports?",
                 ]
-            )
-        )
-        answers_resp = _make_openai_parse_response(
+            ),
             _CoVeAnswersResponse(
                 answers=[
                     "Quarterly",
                     "The Vendor",
                 ]
+            ),
+        ]):
+            results = extract_and_verify(
+                SAMPLE_CONTRACT_TEXT,
+                claude_client=mock_claude,
             )
-        )
-
-        mock_openai.beta.chat.completions.parse.side_effect = [
-            party_roles_resp,   # extract_party_roles
-            extraction_resp,    # extract_obligations
-            questions_resp,     # run_cove step 1
-            answers_resp,       # run_cove step 2
-        ]
-
-        mock_anthropic.messages.create.return_value = _make_anthropic_response(
-            '{"verified": true, "confidence": 0.88, '
-            '"reason": "Obligation matches the source clause."}'
-        )
-
-        results = extract_and_verify(
-            SAMPLE_CONTRACT_TEXT,
-            openai_client=mock_openai,
-            anthropic_client=mock_anthropic,
-        )
 
         assert len(results) == 1
         entry = results[0]
@@ -537,6 +460,3 @@ class TestFullPipeline:
 
         # All checks passed.
         assert entry["status"] == "VERIFIED"
-
-        # OpenAI was called 4 times: roles + extraction + CoVe questions + CoVe answers.
-        assert mock_openai.beta.chat.completions.parse.call_count == 4

@@ -15,9 +15,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
 
-    # Anthropic (Claude - verification)
+    # Anthropic (Claude - classification & verification)
     anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-4-5-20250514"
+    anthropic_model: str = "claude-opus-4-6"
 
     # Mistral (OCR)
     mistral_api_key: str = ""

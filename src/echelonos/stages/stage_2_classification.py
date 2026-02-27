@@ -1,8 +1,8 @@
 """Stage 2: Document Classification.
 
 Classifies contract documents into categories (MSA, SOW, Amendment, etc.)
-using GPT-4o with structured output.  Extracts key metadata such as parties,
-effective date, and parent contract references.
+using Claude with structured output via tool_use.  Extracts key metadata
+such as parties, effective date, and parent contract references.
 """
 
 import re
@@ -11,7 +11,7 @@ import structlog
 from pydantic import BaseModel
 
 from echelonos.config import settings
-from echelonos.llm.openai_client import extract_with_structured_output, get_openai_client
+from echelonos.llm.claude_client import extract_with_structured_output, get_anthropic_client
 
 log = structlog.get_logger(__name__)
 
@@ -85,8 +85,7 @@ Classify the document into exactly one of the following categories:
 5. **confidence** -- Your confidence in the classification as a float
    between 0.0 and 1.0.
 
-Respond ONLY with the structured JSON output matching the schema.  Do not
-include any commentary outside of the JSON structure.
+Use the structured_output tool to return the result.
 """
 
 
@@ -97,17 +96,17 @@ include any commentary outside of the JSON structure.
 
 def classify_document(
     text: str,
-    openai_client=None,
+    claude_client=None,
 ) -> ClassificationResult:
-    """Classify a contract document using GPT-4o with structured output.
+    """Classify a contract document using Claude with structured output.
 
     Parameters
     ----------
     text:
         The full text of the contract document to classify.
-    openai_client:
-        An optional pre-configured ``OpenAI`` client instance.  When *None*
-        a new client is created via :func:`get_openai_client`.
+    claude_client:
+        An optional pre-configured ``Anthropic`` client instance.  When
+        *None* a new client is created via :func:`get_anthropic_client`.
 
     Returns
     -------
@@ -127,7 +126,7 @@ def classify_document(
             confidence=0.0,
         )
 
-    client = openai_client or get_openai_client()
+    client = claude_client or get_anthropic_client()
 
     result: ClassificationResult = extract_with_structured_output(
         client=client,

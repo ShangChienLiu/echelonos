@@ -1,14 +1,13 @@
 """E2E tests for Stage 5: Amendment Resolution (Chain Walking).
 
-All LLM calls (OpenAI clause comparison) are mocked to enable deterministic
+All LLM calls (Claude clause comparison) are mocked to enable deterministic
 testing without API keys or network access.  Mock responses are designed to
 be realistic representations of actual LLM output.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -26,30 +25,30 @@ from echelonos.stages.stage_5_amendment import (
 # ---------------------------------------------------------------------------
 
 
-def _make_openai_parse_response(parsed_obj):
-    """Build a mock OpenAI structured-output response."""
-    message = SimpleNamespace(parsed=parsed_obj)
-    choice = SimpleNamespace(message=message)
-    return SimpleNamespace(choices=[choice])
+def _patch_structured(return_value):
+    """Patch extract_with_structured_output in stage_5_amendment."""
+    return patch(
+        "echelonos.stages.stage_5_amendment.extract_with_structured_output",
+        return_value=return_value,
+    )
 
 
-def _mock_openai_client():
-    """Return a MagicMock that behaves like an OpenAI client."""
-    client = MagicMock()
-    client.beta.chat.completions.parse = MagicMock()
-    return client
+def _patch_structured_side_effect(side_effect):
+    """Patch extract_with_structured_output with multiple return values."""
+    return patch(
+        "echelonos.stages.stage_5_amendment.extract_with_structured_output",
+        side_effect=side_effect,
+    )
 
 
 def _make_comparison_response(action: str, reasoning: str, confidence: float):
     """Build a mock _ComparisonResponse object for clause comparison."""
     from echelonos.stages.stage_5_amendment import _ComparisonResponse
 
-    return _make_openai_parse_response(
-        _ComparisonResponse(
-            action=action,
-            reasoning=reasoning,
-            confidence=confidence,
-        )
+    return _ComparisonResponse(
+        action=action,
+        reasoning=reasoning,
+        confidence=confidence,
     )
 
 
@@ -349,24 +348,22 @@ class TestCompareClausesReplace:
 
     def test_compare_clauses_replace(self):
         """LLM determines the amendment replaces the original."""
-        mock_client = _mock_openai_client()
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_comparison_response(
-                action="REPLACE",
-                reasoning=(
-                    "The amendment entirely replaces the delivery timeline from "
-                    "30 calendar days to 15 business days. The original clause "
-                    "is no longer in effect."
-                ),
-                confidence=0.95,
-            )
+        response = _make_comparison_response(
+            action="REPLACE",
+            reasoning=(
+                "The amendment entirely replaces the delivery timeline from "
+                "30 calendar days to 15 business days. The original clause "
+                "is no longer in effect."
+            ),
+            confidence=0.95,
         )
 
-        result = compare_clauses(
-            original_clause=MSA_OBLIGATION_DELIVERY["source_clause"],
-            amendment_clause=AMENDMENT_1_DELIVERY["source_clause"],
-            openai_client=mock_client,
-        )
+        with _patch_structured(response):
+            result = compare_clauses(
+                original_clause=MSA_OBLIGATION_DELIVERY["source_clause"],
+                amendment_clause=AMENDMENT_1_DELIVERY["source_clause"],
+                claude_client=MagicMock(),
+            )
 
         assert isinstance(result, ResolutionResult)
         assert result.action == "REPLACE"
@@ -375,32 +372,28 @@ class TestCompareClausesReplace:
         assert result.original_clause == MSA_OBLIGATION_DELIVERY["source_clause"]
         assert result.amendment_clause == AMENDMENT_1_DELIVERY["source_clause"]
 
-        mock_client.beta.chat.completions.parse.assert_called_once()
-
 
 class TestCompareClausesModify:
     """Amendment modifies original clause -> MODIFY."""
 
     def test_compare_clauses_modify(self):
         """LLM determines the amendment modifies the original."""
-        mock_client = _mock_openai_client()
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_comparison_response(
-                action="MODIFY",
-                reasoning=(
-                    "The amendment changes the payment term from 45 days to 30 "
-                    "days and reduces the interest rate from 1.5% to 1.0%. The "
-                    "core payment obligation remains but is modified."
-                ),
-                confidence=0.90,
-            )
+        response = _make_comparison_response(
+            action="MODIFY",
+            reasoning=(
+                "The amendment changes the payment term from 45 days to 30 "
+                "days and reduces the interest rate from 1.5% to 1.0%. The "
+                "core payment obligation remains but is modified."
+            ),
+            confidence=0.90,
         )
 
-        result = compare_clauses(
-            original_clause=MSA_OBLIGATION_PAYMENT["source_clause"],
-            amendment_clause=AMENDMENT_1_PAYMENT["source_clause"],
-            openai_client=mock_client,
-        )
+        with _patch_structured(response):
+            result = compare_clauses(
+                original_clause=MSA_OBLIGATION_PAYMENT["source_clause"],
+                amendment_clause=AMENDMENT_1_PAYMENT["source_clause"],
+                claude_client=MagicMock(),
+            )
 
         assert isinstance(result, ResolutionResult)
         assert result.action == "MODIFY"
@@ -414,24 +407,22 @@ class TestCompareClausesUnchanged:
 
     def test_compare_clauses_unchanged(self):
         """LLM determines the amendment does not affect the original."""
-        mock_client = _mock_openai_client()
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_comparison_response(
-                action="UNCHANGED",
-                reasoning=(
-                    "The amendment clause concerns delivery timelines while the "
-                    "original clause deals with confidentiality. These clauses "
-                    "address completely different subject matter."
-                ),
-                confidence=0.98,
-            )
+        response = _make_comparison_response(
+            action="UNCHANGED",
+            reasoning=(
+                "The amendment clause concerns delivery timelines while the "
+                "original clause deals with confidentiality. These clauses "
+                "address completely different subject matter."
+            ),
+            confidence=0.98,
         )
 
-        result = compare_clauses(
-            original_clause=MSA_OBLIGATION_CONFIDENTIALITY["source_clause"],
-            amendment_clause=AMENDMENT_1_DELIVERY["source_clause"],
-            openai_client=mock_client,
-        )
+        with _patch_structured(response):
+            result = compare_clauses(
+                original_clause=MSA_OBLIGATION_CONFIDENTIALITY["source_clause"],
+                amendment_clause=AMENDMENT_1_DELIVERY["source_clause"],
+                claude_client=MagicMock(),
+            )
 
         assert isinstance(result, ResolutionResult)
         assert result.action == "UNCHANGED"
@@ -448,23 +439,21 @@ class TestResolveObligationSuperseded:
 
     def test_resolve_obligation_superseded(self):
         """Delivery obligation is replaced by amendment with shorter deadline."""
-        mock_client = _mock_openai_client()
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_comparison_response(
-                action="REPLACE",
-                reasoning=(
-                    "The amendment replaces the 30-day delivery requirement "
-                    "with a 15-business-day requirement."
-                ),
-                confidence=0.95,
-            )
+        response = _make_comparison_response(
+            action="REPLACE",
+            reasoning=(
+                "The amendment replaces the 30-day delivery requirement "
+                "with a 15-business-day requirement."
+            ),
+            confidence=0.95,
         )
 
-        result = resolve_obligation(
-            obligation=MSA_OBLIGATION_DELIVERY,
-            amendment_obligations=[AMENDMENT_1_DELIVERY],
-            openai_client=mock_client,
-        )
+        with _patch_structured(response):
+            result = resolve_obligation(
+                obligation=MSA_OBLIGATION_DELIVERY,
+                amendment_obligations=[AMENDMENT_1_DELIVERY],
+                claude_client=MagicMock(),
+            )
 
         assert result["status"] == "SUPERSEDED"
         assert len(result["amendment_history"]) == 1
@@ -479,24 +468,21 @@ class TestResolveObligationStaysActive:
 
     def test_resolve_obligation_stays_active(self):
         """Confidentiality obligation is unrelated to delivery amendment."""
-        mock_client = _mock_openai_client()
-
         # The heuristic pre-filter should skip the LLM call since the
         # confidentiality and delivery clauses have low keyword overlap.
         # If it does call the LLM, it returns UNCHANGED.
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_comparison_response(
-                action="UNCHANGED",
-                reasoning="The clauses address different subject matter.",
-                confidence=0.99,
-            )
+        response = _make_comparison_response(
+            action="UNCHANGED",
+            reasoning="The clauses address different subject matter.",
+            confidence=0.99,
         )
 
-        result = resolve_obligation(
-            obligation=MSA_OBLIGATION_CONFIDENTIALITY,
-            amendment_obligations=[AMENDMENT_1_DELIVERY],
-            openai_client=mock_client,
-        )
+        with _patch_structured(response):
+            result = resolve_obligation(
+                obligation=MSA_OBLIGATION_CONFIDENTIALITY,
+                amendment_obligations=[AMENDMENT_1_DELIVERY],
+                claude_client=MagicMock(),
+            )
 
         assert result["status"] == "ACTIVE"
         # Original data is preserved.
@@ -529,8 +515,6 @@ class TestResolveChainEndToEnd:
         - Confidentiality: ACTIVE (untouched by heuristic + type mismatch)
         - SLA: TERMINATED by Amendment #2
         """
-        mock_client = _mock_openai_client()
-
         # The LLM call sequence depends on which pairs pass the pre-filter.
         # Pairs are compared when either:
         #   (a) obligation_type matches (same type bypass), or
@@ -590,8 +574,6 @@ class TestResolveChainEndToEnd:
                 )
             )
 
-        mock_client.beta.chat.completions.parse.side_effect = responses
-
         chain_docs = [
             {
                 "doc_id": "msa-001",
@@ -620,7 +602,8 @@ class TestResolveChainEndToEnd:
             },
         ]
 
-        resolved = resolve_amendment_chain(chain_docs, openai_client=mock_client)
+        with _patch_structured_side_effect(responses):
+            resolved = resolve_amendment_chain(chain_docs, claude_client=MagicMock())
 
         # Collect results by source.
         msa_resolved = [r for r in resolved if r.get("source_doc_id") == "msa-001"]
@@ -698,17 +681,15 @@ class TestUnlinkedDocsStayUnresolved:
             },
         ]
 
-        mock_client = _mock_openai_client()
         # The MSA delivery vs Amendment delivery comparison.
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_comparison_response(
-                action="REPLACE",
-                reasoning="Delivery timeline changed.",
-                confidence=0.95,
-            )
+        response = _make_comparison_response(
+            action="REPLACE",
+            reasoning="Delivery timeline changed.",
+            confidence=0.95,
         )
 
-        result = resolve_all(documents, links, openai_client=mock_client)
+        with _patch_structured(response):
+            result = resolve_all(documents, links, claude_client=MagicMock())
 
         # Find the standalone document's obligations.
         standalone_obls = [
@@ -783,24 +764,22 @@ class TestDeleteDetection:
 
     def test_delete_detection(self):
         """An amendment that explicitly deletes a section terminates the obligation."""
-        mock_client = _mock_openai_client()
-        mock_client.beta.chat.completions.parse.return_value = (
-            _make_comparison_response(
-                action="DELETE",
-                reasoning=(
-                    "The amendment explicitly states that Section 4.1 is "
-                    "'hereby deleted in its entirety'. The original SLA "
-                    "obligation is terminated with no replacement."
-                ),
-                confidence=0.97,
-            )
+        response = _make_comparison_response(
+            action="DELETE",
+            reasoning=(
+                "The amendment explicitly states that Section 4.1 is "
+                "'hereby deleted in its entirety'. The original SLA "
+                "obligation is terminated with no replacement."
+            ),
+            confidence=0.97,
         )
 
-        result = resolve_obligation(
-            obligation=MSA_OBLIGATION_SLA,
-            amendment_obligations=[AMENDMENT_2_SLA_DELETE],
-            openai_client=mock_client,
-        )
+        with _patch_structured(response):
+            result = resolve_obligation(
+                obligation=MSA_OBLIGATION_SLA,
+                amendment_obligations=[AMENDMENT_2_SLA_DELETE],
+                claude_client=MagicMock(),
+            )
 
         assert result["status"] == "TERMINATED"
         assert len(result["amendment_history"]) == 1
@@ -811,11 +790,8 @@ class TestDeleteDetection:
 
     def test_delete_stops_further_processing(self):
         """Once terminated, subsequent amendments do not change the status."""
-        mock_client = _mock_openai_client()
-
-        # First comparison: DELETE.
-        # Second comparison should NOT happen because obligation is TERMINATED.
-        mock_client.beta.chat.completions.parse.side_effect = [
+        responses = [
+            # First comparison: DELETE.
             _make_comparison_response(
                 action="DELETE",
                 reasoning="Section explicitly deleted.",
@@ -861,11 +837,12 @@ class TestDeleteDetection:
             "confidence": 0.92,
         }
 
-        result = resolve_obligation(
-            obligation=MSA_OBLIGATION_SLA,
-            amendment_obligations=[amend_delete, amend_second],
-            openai_client=mock_client,
-        )
+        with _patch_structured_side_effect(responses):
+            result = resolve_obligation(
+                obligation=MSA_OBLIGATION_SLA,
+                amendment_obligations=[amend_delete, amend_second],
+                claude_client=MagicMock(),
+            )
 
         assert result["status"] == "TERMINATED"
         # Only one history entry -- processing stopped after DELETE.
@@ -922,8 +899,6 @@ class TestResolveAllIntegration:
             },
         ]
 
-        mock_client = _mock_openai_client()
-
         # Provide enough responses for all possible comparisons.
         responses = [
             _make_comparison_response(
@@ -941,9 +916,9 @@ class TestResolveAllIntegration:
                     confidence=0.99,
                 )
             )
-        mock_client.beta.chat.completions.parse.side_effect = responses
 
-        result = resolve_all(documents, links, openai_client=mock_client)
+        with _patch_structured_side_effect(responses):
+            result = resolve_all(documents, links, claude_client=MagicMock())
 
         # Chain: msa-001 (2 obligations) + amend-001 (1 obligation) = 3 from chain.
         # Standalone: 1 obligation.

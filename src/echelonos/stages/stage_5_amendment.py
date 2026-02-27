@@ -24,7 +24,7 @@ import structlog
 from pydantic import BaseModel
 
 from echelonos.config import settings
-from echelonos.llm.openai_client import get_openai_client
+from echelonos.llm.claude_client import extract_with_structured_output, get_anthropic_client
 
 log = structlog.get_logger(__name__)
 
@@ -161,7 +161,7 @@ def build_amendment_chain(doc_links: list[dict]) -> list[list[str]]:
 def compare_clauses(
     original_clause: str,
     amendment_clause: str,
-    openai_client: Any = None,
+    claude_client: Any = None,
 ) -> ResolutionResult:
     """Compare an original clause against an amendment clause using LLM.
 
@@ -175,8 +175,8 @@ def compare_clauses(
         obligation.
     amendment_clause:
         The source clause text from the amendment.
-    openai_client:
-        Optional pre-configured OpenAI client (useful for testing).
+    claude_client:
+        Optional pre-configured Anthropic client (useful for testing).
 
     Returns
     -------
@@ -188,23 +188,19 @@ def compare_clauses(
         amendment_len=len(amendment_clause),
     )
 
-    client = openai_client or get_openai_client()
+    client = claude_client or get_anthropic_client()
 
     user_prompt = (
         f"Original clause:\n{original_clause}\n\n"
         f"Amendment clause:\n{amendment_clause}"
     )
 
-    result = client.beta.chat.completions.parse(
-        model=settings.openai_model,
-        messages=[
-            {"role": "system", "content": _CLAUSE_COMPARISON_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
+    parsed: _ComparisonResponse = extract_with_structured_output(
+        client=client,
+        system_prompt=_CLAUSE_COMPARISON_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
         response_format=_ComparisonResponse,
     )
-
-    parsed: _ComparisonResponse = result.choices[0].message.parsed
 
     resolution = ResolutionResult(
         action=parsed.action,
@@ -261,7 +257,7 @@ def _clauses_potentially_related(
 def resolve_obligation(
     obligation: dict,
     amendment_obligations: list[dict],
-    openai_client: Any = None,
+    claude_client: Any = None,
 ) -> dict:
     """Resolve a single original obligation against amendment obligations.
 
@@ -278,8 +274,8 @@ def resolve_obligation(
     amendment_obligations:
         List of obligation dicts from amendment document(s), in
         chronological order.
-    openai_client:
-        Optional pre-configured OpenAI client.
+    claude_client:
+        Optional pre-configured Anthropic client.
 
     Returns
     -------
@@ -316,7 +312,7 @@ def resolve_obligation(
         resolution = compare_clauses(
             original_clause=obligation.get("source_clause", ""),
             amendment_clause=amend_obl.get("source_clause", ""),
-            openai_client=openai_client,
+            claude_client=claude_client,
         )
 
         record = {
@@ -379,7 +375,7 @@ def _get_doc_obligations(doc_id: str, documents: list[dict]) -> list[dict]:
 
 def resolve_amendment_chain(
     chain_docs: list[dict],
-    openai_client: Any = None,
+    claude_client: Any = None,
 ) -> list[dict]:
     """Resolve one full amendment chain.
 
@@ -392,8 +388,8 @@ def resolve_amendment_chain(
     ----------
     chain_docs:
         Ordered list of document dicts (MSA first, then amendments).
-    openai_client:
-        Optional pre-configured OpenAI client.
+    claude_client:
+        Optional pre-configured Anthropic client.
 
     Returns
     -------
@@ -422,7 +418,7 @@ def resolve_amendment_chain(
         resolved_obl = resolve_obligation(
             obl,
             amendment_obligations,
-            openai_client=openai_client,
+            claude_client=claude_client,
         )
         resolved_obl["source_doc_id"] = msa_doc.get("doc_id") or msa_doc.get("id")
         resolved.append(resolved_obl)
@@ -456,7 +452,7 @@ def resolve_amendment_chain(
 def resolve_all(
     documents: list[dict],
     links: list[dict],
-    openai_client: Any = None,
+    claude_client: Any = None,
 ) -> list[dict]:
     """Resolve amendment chains across all documents.
 
@@ -476,8 +472,8 @@ def resolve_all(
     links:
         Link records from Stage 4.  Each dict should have ``child_doc_id``,
         ``parent_doc_id``, and ``status``.
-    openai_client:
-        Optional pre-configured OpenAI client.
+    claude_client:
+        Optional pre-configured Anthropic client.
 
     Returns
     -------
@@ -523,7 +519,7 @@ def resolve_all(
         if chain_docs:
             resolved = resolve_amendment_chain(
                 chain_docs,
-                openai_client=openai_client,
+                claude_client=claude_client,
             )
             all_obligations.extend(resolved)
 

@@ -1,7 +1,7 @@
 """E2E tests for Stage 2: Document Classification.
 
 Each test exercises the public API of stage_2_classification with a mocked
-OpenAI client so that no real API calls are made.  The mock returns realistic
+Claude client so that no real API calls are made.  The mock returns realistic
 structured responses matching the ClassificationResult schema.
 """
 
@@ -19,17 +19,6 @@ from echelonos.stages.stage_2_classification import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_mock_client(result: ClassificationResult) -> MagicMock:
-    """Build a mock OpenAI client whose ``extract_with_structured_output``
-    call will return *result*.
-
-    We patch ``extract_with_structured_output`` at the module level so that
-    ``classify_document`` receives the prepared result regardless of how the
-    real OpenAI SDK would behave.
-    """
-    return result  # The patch target is the function, not the client object.
 
 
 def _patch_extract(result: ClassificationResult):
@@ -116,7 +105,7 @@ class TestClassifyDocument:
         )
 
         with _patch_extract(expected):
-            result = classify_document(MSA_TEXT, openai_client=MagicMock())
+            result = classify_document(MSA_TEXT, claude_client=MagicMock())
 
         assert result.doc_type == "MSA"
         assert result.confidence >= 0.7
@@ -134,7 +123,7 @@ class TestClassifyDocument:
         )
 
         with _patch_extract(expected):
-            result = classify_document(AMENDMENT_TEXT, openai_client=MagicMock())
+            result = classify_document(AMENDMENT_TEXT, claude_client=MagicMock())
 
         assert result.doc_type == "Amendment"
         assert result.parent_reference_raw is not None
@@ -152,7 +141,7 @@ class TestClassifyDocument:
         )
 
         with _patch_extract(expected):
-            result = classify_document(SOW_TEXT, openai_client=MagicMock())
+            result = classify_document(SOW_TEXT, claude_client=MagicMock())
 
         assert result.doc_type == "UNKNOWN"
         assert result.confidence == 0.5
@@ -168,7 +157,7 @@ class TestClassifyDocument:
         )
 
         with _patch_extract(expected):
-            result = classify_document(NDA_TEXT, openai_client=MagicMock())
+            result = classify_document(NDA_TEXT, claude_client=MagicMock())
 
         assert len(result.parties) == 2
         assert "TechStart LLC" in result.parties
@@ -185,14 +174,14 @@ class TestClassifyDocument:
         )
 
         with _patch_extract(expected):
-            result = classify_document(MSA_TEXT, openai_client=MagicMock())
+            result = classify_document(MSA_TEXT, claude_client=MagicMock())
 
         assert result.effective_date == "2025-01-15"
 
     def test_empty_text_handling(self) -> None:
         """An empty string input should return UNKNOWN with zero confidence
         without making an API call."""
-        result = classify_document("", openai_client=MagicMock())
+        result = classify_document("", claude_client=MagicMock())
 
         assert result.doc_type == "UNKNOWN"
         assert result.confidence == 0.0
@@ -202,7 +191,7 @@ class TestClassifyDocument:
 
     def test_whitespace_only_text_handling(self) -> None:
         """Whitespace-only input should be treated the same as empty."""
-        result = classify_document("   \n\t  ", openai_client=MagicMock())
+        result = classify_document("   \n\t  ", claude_client=MagicMock())
 
         assert result.doc_type == "UNKNOWN"
         assert result.confidence == 0.0
