@@ -70,7 +70,7 @@ def extract_with_structured_output(
 
     response = client.messages.create(
         model=settings.anthropic_model,
-        max_tokens=2048,
+        max_tokens=16384,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
         tools=tools,

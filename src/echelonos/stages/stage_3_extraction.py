@@ -153,7 +153,7 @@ _EXTRACTION_SYSTEM_PROMPT = (
 class _ExtractionResponse(BaseModel):
     """Structured response wrapping a list of obligations."""
 
-    obligations: list[Obligation]
+    obligations: list[Obligation] = []
 
 
 def extract_obligations(
