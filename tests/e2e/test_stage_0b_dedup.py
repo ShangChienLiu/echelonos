@@ -10,17 +10,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from datasketch import MinHash
 from docx import Document as DocxDocument
 
 from echelonos.stages.stage_0b_dedup import (
     compute_content_hash,
     compute_file_hash,
-    compute_simhash,
+    compute_minhash,
     compute_structural_fingerprint,
     deduplicate_files,
     extract_identity_tokens,
     extract_text,
-    hamming_distance,
 )
 
 # ---------------------------------------------------------------------------
@@ -182,14 +182,12 @@ class TestContentDuplicateDetected:
 
 
 class TestNearDuplicateDetected:
-    """Layer 3: Files that differ by at most 1 bit of SimHash should be flagged."""
+    """Layer 3: Files with high Jaccard similarity (>= 0.85) should be flagged."""
 
     def test_near_duplicate_detected(self, tmp_path: Path):
         """Same document with word-order swap (e.g. OCR artefact) should be
-        caught by Layer 3 at SimHash distance 0.
-
-        We need content that differs at byte level (Layer 1) AND
-        normalized-text level (Layer 2) so Layer 3 is exercised.
+        caught by Layer 3 — MinHash uses bag-of-words so word order doesn't
+        matter and Jaccard should be ~1.0.
         """
         base_text = (
             "This Master Services Agreement is entered into by and between "
@@ -198,7 +196,7 @@ class TestNearDuplicateDetected:
             "provision of consulting services as described herein."
         )
         # Swap two words: "Acme Corporation" -> "Corporation Acme"
-        # SimHash uses bag-of-words so this is distance 0
+        # MinHash uses bag-of-words so this has Jaccard ~1.0
         variant_text = (
             "This Master Services Agreement is entered into by and between "
             "Corporation Acme and Widget Incorporated effective January 15 2024. "
@@ -215,11 +213,11 @@ class TestNearDuplicateDetected:
         text_b = extract_text(str(pdf_b))
         assert compute_content_hash(text_a) != compute_content_hash(text_b)
 
-        # SimHash distance should be 0 or 1
-        sh_a = compute_simhash(text_a)
-        sh_b = compute_simhash(text_b)
-        assert hamming_distance(sh_a, sh_b) <= 1, (
-            f"Expected hamming distance <= 1, got {hamming_distance(sh_a, sh_b)}"
+        # MinHash Jaccard should be very high (word-order swap -> same bag-of-words)
+        mh_a = compute_minhash(text_a)
+        mh_b = compute_minhash(text_b)
+        assert mh_a.jaccard(mh_b) >= 0.85, (
+            f"Expected Jaccard >= 0.85, got {mh_a.jaccard(mh_b)}"
         )
 
         files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
@@ -230,39 +228,6 @@ class TestNearDuplicateDetected:
         dup = files[1]
         assert dup["is_duplicate"] is True
         assert dup["dedup_layer"] == 3
-
-    def test_one_word_change_not_flagged(self, tmp_path: Path):
-        """Changing even one substantive word should NOT be flagged at
-        threshold=1, because legal contracts share boilerplate that makes
-        SimHash distance artificially small at k>1."""
-        base_text = (
-            "This Master Services Agreement is entered into by and between "
-            "Acme Corporation and Widget Incorporated effective January 15 2024. "
-            "The parties agree to the following terms and conditions for the "
-            "provision of consulting services as described herein."
-        )
-        edited_text = (
-            "This Master Services Agreement is entered into by and between "
-            "Acme Corporation and Widget Incorporated effective January 15 2024. "
-            "The parties agree to the following terms and conditions for the "
-            "provision of advisory services as described herein."
-        )
-
-        pdf_a = _make_pdf(tmp_path / "consulting.pdf", base_text)
-        pdf_b = _make_pdf(tmp_path / "advisory.pdf", edited_text)
-
-        text_a = extract_text(str(pdf_a))
-        text_b = extract_text(str(pdf_b))
-        sh_a = compute_simhash(text_a)
-        sh_b = compute_simhash(text_b)
-        dist = hamming_distance(sh_a, sh_b)
-        assert dist > 1, f"Test setup: expected distance > 1, got {dist}"
-
-        files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
-        unique = deduplicate_files(files)
-
-        # Both should survive — substantive difference
-        assert len(unique) == 2
 
 
 class TestAmendmentNotFlagged:
@@ -357,46 +322,42 @@ class TestScannedPdfsNotDeduplicated:
         assert len(result) == 3, f"Expected 3 unique, got {len(result)}"
 
 
-class TestSimhashThresholdRejectsDistantPairs:
-    """Layer 3 should NOT flag documents at Hamming distance > 1.
+class TestMinhashThresholdRejectsDissimilarDocs:
+    """Layer 3 should NOT flag documents with Jaccard similarity below 0.85.
 
     Legal contracts share boilerplate language that produces artificially
-    similar SimHash fingerprints.  At threshold k=3, many unrelated
-    contracts are falsely collapsed.  The threshold should be k=1 so only
-    truly near-identical documents are flagged.
+    similar fingerprints.  MinHash with threshold 0.85 should only flag
+    truly near-identical documents.
     """
 
-    def test_different_contracts_at_distance_2_not_flagged(self, tmp_path: Path):
-        """Two contracts sharing boilerplate but with a substantive word
-        change should NOT be flagged.  This pair produces SimHash distance 2,
-        which would be a false positive at the old threshold of k=3.
+    def test_different_contracts_below_threshold_not_flagged(self, tmp_path: Path):
+        """Two contracts sharing some boilerplate but with substantial
+        differences should NOT be flagged as duplicates.
         """
         contract_a = (
-            "This Master Services Agreement is entered into by and between "
-            "Acme Corporation and Widget Incorporated effective January 15 2024. "
-            "The parties agree to the following terms and conditions for the "
-            "provision of consulting services as described herein."
+            "Non-Disclosure Agreement between Alpha Corp and Beta LLC. "
+            "This agreement governs the sharing of confidential information "
+            "between the parties for the purpose of evaluating a potential "
+            "business relationship in the field of software development."
         )
-        # Change one word: "consulting" -> "advisory", producing distance ~2
         contract_b = (
-            "This Master Services Agreement is entered into by and between "
-            "Acme Corporation and Widget Incorporated effective January 15 2024. "
-            "The parties agree to the following terms and conditions for the "
-            "provision of advisory services as described herein."
+            "Master Services Agreement between Gamma Inc and Delta Partners. "
+            "This agreement establishes the terms and conditions under which "
+            "consulting services will be provided for the enterprise data "
+            "migration project commencing January 2025."
         )
 
-        pdf_a = _make_pdf(tmp_path / "consulting_msa.pdf", contract_a)
-        pdf_b = _make_pdf(tmp_path / "advisory_msa.pdf", contract_b)
+        pdf_a = _make_pdf(tmp_path / "nda.pdf", contract_a)
+        pdf_b = _make_pdf(tmp_path / "msa.pdf", contract_b)
 
         text_a = extract_text(str(pdf_a))
         text_b = extract_text(str(pdf_b))
-        assert compute_content_hash(text_a) != compute_content_hash(text_b)
 
-        sh_a = compute_simhash(text_a)
-        sh_b = compute_simhash(text_b)
-        dist = hamming_distance(sh_a, sh_b)
-        assert dist > 1, (
-            f"Test setup error: expected hamming distance > 1, got {dist}"
+        # Verify Jaccard is below threshold
+        mh_a = compute_minhash(text_a)
+        mh_b = compute_minhash(text_b)
+        assert mh_a.jaccard(mh_b) < 0.85, (
+            f"Test setup error: expected Jaccard < 0.85, got {mh_a.jaccard(mh_b)}"
         )
 
         files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
@@ -405,7 +366,7 @@ class TestSimhashThresholdRejectsDistantPairs:
         # Both should be kept — they are different contracts
         assert len(unique) == 2, (
             f"Expected 2 unique, got {len(unique)}; "
-            f"SimHash distance was {dist}"
+            f"Jaccard was {mh_a.jaccard(mh_b)}"
         )
 
 
@@ -437,28 +398,37 @@ class TestEmptyInput:
         assert deduplicate_files([]) == []
 
 
-class TestHammingDistanceCalculation:
-    """Unit-level tests for the hamming_distance helper."""
+class TestComputeMinhash:
+    """Unit-level tests for the compute_minhash function."""
 
-    def test_identical_hashes(self):
-        assert hamming_distance(0, 0) == 0
-        assert hamming_distance(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF) == 0
+    def test_identical_text_yields_jaccard_one(self):
+        text = "This is a test document with several words for hashing."
+        mh1 = compute_minhash(text)
+        mh2 = compute_minhash(text)
+        assert mh1.jaccard(mh2) == 1.0
 
-    def test_single_bit_difference(self):
-        assert hamming_distance(0b0000, 0b0001) == 1
-        assert hamming_distance(0b1000, 0b0000) == 1
+    def test_word_order_swap_yields_jaccard_one(self):
+        """MinHash is set-based, so word order doesn't matter."""
+        text_a = "alpha beta gamma delta epsilon"
+        text_b = "epsilon delta gamma beta alpha"
+        mh_a = compute_minhash(text_a)
+        mh_b = compute_minhash(text_b)
+        assert mh_a.jaccard(mh_b) == 1.0
 
-    def test_known_distance(self):
-        # 0b1010 vs 0b0101 -> all 4 bits differ
-        assert hamming_distance(0b1010, 0b0101) == 4
+    def test_completely_different_text_yields_low_jaccard(self):
+        text_a = "apple banana cherry dragonfruit elderberry fig grape"
+        text_b = "quantum physics thermodynamics relativity mechanics entropy"
+        mh_a = compute_minhash(text_a)
+        mh_b = compute_minhash(text_b)
+        assert mh_a.jaccard(mh_b) < 0.2
 
-    def test_large_distance(self):
-        # All 64 bits differ
-        assert hamming_distance(0, 0xFFFFFFFFFFFFFFFF) == 64
+    def test_empty_text_returns_valid_minhash(self):
+        mh = compute_minhash("")
+        assert isinstance(mh, MinHash)
 
-    def test_symmetry(self):
-        a, b = 12345, 67890
-        assert hamming_distance(a, b) == hamming_distance(b, a)
+    def test_respects_num_perm(self):
+        mh = compute_minhash("test text", num_perm=64)
+        assert len(mh.hashvalues) == 64
 
 
 class TestComputeStructuralFingerprint:
@@ -568,7 +538,7 @@ class TestExtractIdentityTokens:
         assert extract_identity_tokens("no numbers here") == ""
 
 
-class TestIdentityTokensPreventSimhashFalsePositives:
+class TestIdentityTokensPreventMinhashFalsePositives:
     """Template-based documents with different identifying details (PO numbers,
     amounts, dates) should NOT be collapsed by Layer 3, because their identity
     tokens differ and Layer 4 protects them.
@@ -576,21 +546,25 @@ class TestIdentityTokensPreventSimhashFalsePositives:
 
     def test_same_template_different_po_numbers_kept(self, tmp_path: Path):
         """Two POs from the same vendor template with different PO numbers,
-        dates, and amounts must both survive dedup.  We use a word-order
-        swap plus different PO details so SimHash distance is 0 (would be
-        flagged by Layer 3) but identity tokens differ (Layer 4 protects).
+        dates, and amounts must both survive dedup.  They have high Jaccard
+        similarity (would be flagged by Layer 3) but identity tokens differ
+        (Layer 4 protects).
         """
-        # Long shared boilerplate with identifying details that differ
+        # Long shared boilerplate with identifying details that differ.
+        # Needs enough shared words to push Jaccard above 0.85 threshold.
         boilerplate = (
             "7th Street Solutions LLC Temporary Staffing Services "
             "Terms and Conditions Net 30 Ship to 123 Main Street "
             "Authorized by John Smith Department of Operations "
             "General Manager Cadillac Products Automotive Company "
             "This purchase order is subject to the terms and conditions "
-            "attached hereto and incorporated herein by reference"
+            "attached hereto and incorporated herein by reference "
+            "Please remit payment to the address listed above "
+            "All invoices must reference the purchase order number "
+            "Vendor agrees to comply with all applicable laws and regulations "
+            "governing the performance of services under this agreement"
         )
         po_a = f"Purchase Order 4501693981 Date 05/13/2025 Amount $3,800.00 {boilerplate}"
-        # Same words in different order + different PO details -> SimHash ~0
         po_b = f"Purchase Order 4501703538 Date 06/02/2025 Amount $4,125.00 {boilerplate}"
 
         pdf_a = _make_pdf(tmp_path / "po_a.pdf", po_a)
@@ -598,6 +572,13 @@ class TestIdentityTokensPreventSimhashFalsePositives:
 
         text_a = extract_text(str(pdf_a))
         text_b = extract_text(str(pdf_b))
+
+        # Verify high Jaccard similarity (MinHash would flag them)
+        mh_a = compute_minhash(text_a)
+        mh_b = compute_minhash(text_b)
+        assert mh_a.jaccard(mh_b) >= 0.85, (
+            f"Test setup: expected Jaccard >= 0.85, got {mh_a.jaccard(mh_b)}"
+        )
 
         # Identity tokens must differ
         assert extract_identity_tokens(text_a) != extract_identity_tokens(text_b)
@@ -641,7 +622,7 @@ class TestIdentityTokensPreventSimhashFalsePositives:
         files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
         unique = deduplicate_files(files)
 
-        # Should be deduped — same identity tokens, SimHash match
+        # Should be deduped — same identity tokens, MinHash match
         assert len(unique) == 1
         assert files[1]["is_duplicate"] is True
         assert files[1]["dedup_layer"] == 3

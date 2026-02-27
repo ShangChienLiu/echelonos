@@ -174,7 +174,6 @@ class Fingerprint(Base):
         UniqueConstraint("doc_id", name="uq_fingerprints_doc_id"),
         Index("ix_fingerprints_sha256", "sha256"),
         Index("ix_fingerprints_content_hash", "content_hash"),
-        Index("ix_fingerprints_simhash", "simhash"),
         Index("ix_fingerprints_structural_fingerprint", "structural_fingerprint"),
     )
 
@@ -190,6 +189,8 @@ class Fingerprint(Base):
     sha256: Mapped[Optional[str]] = mapped_column(nullable=True)
     content_hash: Mapped[Optional[str]] = mapped_column(nullable=True)
     simhash: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    minhash_signature: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    identity_tokens: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     structural_fingerprint: Mapped[Optional[str]] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, nullable=False)
 

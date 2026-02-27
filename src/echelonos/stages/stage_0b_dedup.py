@@ -2,8 +2,9 @@
 
 Layer 1 - File Hash (SHA-256): Hash raw bytes to catch exact copies.
 Layer 2 - Content Hash: Extract text, normalize, hash to catch format variants.
-Layer 3 - SimHash (64-bit): Fingerprint comparison with Hamming distance <= 1 for near-duplicates.
-Layer 4 - Structural Fingerprint: Hash of (doc_type + date + parties) protects amendments/SOWs.
+Layer 3 - MinHash + LSH: Jaccard similarity via MinHashLSH index for near-duplicates.
+Layer 4 - Identity Tokens + Structural Fingerprint: Protects amendments/SOWs and
+          template-based documents with different PO numbers/amounts/dates.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import re
 import string
 
 import structlog
-from simhash import Simhash
+from datasketch import MinHash, MinHashLSH
 
 logger = structlog.get_logger()
 
@@ -109,26 +110,26 @@ def compute_content_hash(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3: SimHash (64-bit locality-sensitive hash)
+# Layer 3: MinHash + LSH (locality-sensitive hashing for Jaccard similarity)
 # ---------------------------------------------------------------------------
 
+MINHASH_THRESHOLD = 0.85  # Minimum Jaccard similarity to consider near-duplicate
+MINHASH_NUM_PERM = 128  # Number of permutations for MinHash
 
-def compute_simhash(text: str) -> int:
-    """Return a 64-bit SimHash fingerprint of *text*.
+
+def compute_minhash(text: str, num_perm: int = MINHASH_NUM_PERM) -> MinHash:
+    """Return a MinHash fingerprint of *text*.
 
     The fingerprint is built from whitespace-delimited tokens of the
-    normalized text so that minor edits produce a nearby hash.
+    normalized text.  MinHash is set-based, so word order does not affect
+    the result — only the set of unique tokens matters.
     """
+    mh = MinHash(num_perm=num_perm)
     normalized = _normalize_text(text)
     tokens = normalized.split()
-    if not tokens:
-        return Simhash("").value
-    return Simhash(tokens).value
-
-
-def hamming_distance(hash1: int, hash2: int) -> int:
-    """Count the number of differing bits between two integers."""
-    return bin(hash1 ^ hash2).count("1")
+    for token in tokens:
+        mh.update(token.encode("utf-8"))
+    return mh
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +147,7 @@ def extract_identity_tokens(text: str) -> str:
     Returns a canonical pipe-separated string of sorted unique tokens.
     Documents that share a template (same vendor, same doc type) but differ
     in PO number, amount, or date will produce different identity tokens,
-    allowing Layer 4 to protect them from false SimHash matches.
+    allowing Layer 4 to protect them from false MinHash matches.
     """
     numbers = _RE_LONG_NUMBERS.findall(text)
     amounts = _RE_DOLLAR_AMOUNTS.findall(text)
@@ -181,11 +182,15 @@ def compute_structural_fingerprint(
 # Main deduplication entry point
 # ---------------------------------------------------------------------------
 
-SIMHASH_THRESHOLD = 1  # Maximum Hamming distance to consider near-duplicate
 MIN_TEXT_LENGTH = 50  # Minimum chars of extracted text to run Layer 2/3
 
 
-def deduplicate_files(files: list[dict]) -> list[dict]:
+def deduplicate_files(
+    files: list[dict],
+    *,
+    minhash_threshold: float = MINHASH_THRESHOLD,
+    num_perm: int = MINHASH_NUM_PERM,
+) -> list[dict]:
     """Run the 4-layer dedup pipeline over *files* and return unique entries.
 
     Parameters
@@ -193,6 +198,10 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
     files:
         Each dict must contain at least ``{"file_path": str, "status": "VALID"}``.
         Optionally ``doc_type``, ``date``, and ``parties`` for Layer 4 protection.
+    minhash_threshold:
+        Minimum Jaccard similarity for Layer 3 near-duplicate detection.
+    num_perm:
+        Number of permutations for MinHash signatures.
 
     Returns
     -------
@@ -207,9 +216,11 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
     # Accumulators keyed by hash/fingerprint -> first file_path seen
     seen_file_hashes: dict[str, str] = {}
     seen_content_hashes: dict[str, str] = {}
-    # For SimHash we need to compare pairwise against all kept entries
-    # Each tuple: (file_path, simhash, structural_fp, identity_tokens)
-    kept_entries: list[tuple[str, int, str, str]] = []
+
+    # MinHash LSH index for O(1) near-duplicate lookups
+    lsh = MinHashLSH(threshold=minhash_threshold, num_perm=num_perm)
+    # file_path -> (structural_fingerprint, identity_tokens)
+    kept_metadata: dict[str, tuple[str, str]] = {}
 
     unique: list[dict] = []
 
@@ -226,8 +237,8 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
         content_hash = compute_content_hash(text)
         entry["content_hash"] = content_hash
 
-        sim_hash = compute_simhash(text)
-        entry["simhash"] = sim_hash
+        minhash = compute_minhash(text, num_perm=num_perm)
+        entry["minhash_signature"] = minhash.hashvalues.tobytes().hex()
 
         id_tokens = extract_identity_tokens(text) if has_text else ""
         entry["identity_tokens"] = id_tokens
@@ -241,8 +252,7 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
         # --- Layer 1: exact file hash -----------------------------------
         if file_hash in seen_file_hashes:
             candidate = seen_file_hashes[file_hash]
-            # Layer 4 guard: different structural fingerprint -> keep
-            if not _identity_match(structural_fp, id_tokens, candidate, kept_entries):
+            if not _identity_match(structural_fp, id_tokens, candidate, kept_metadata):
                 log.info("dedup.layer4_protected", layer=1, candidate=candidate)
             else:
                 entry["is_duplicate"] = True
@@ -252,11 +262,9 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
                 continue
 
         # --- Layer 2: content hash --------------------------------------
-        # Skip when no text was extracted (e.g. scanned PDFs, images) to
-        # avoid treating every no-text file as a duplicate of the first.
         if has_text and content_hash in seen_content_hashes:
             candidate = seen_content_hashes[content_hash]
-            if not _identity_match(structural_fp, id_tokens, candidate, kept_entries):
+            if not _identity_match(structural_fp, id_tokens, candidate, kept_metadata):
                 log.info("dedup.layer4_protected", layer=2, candidate=candidate)
             else:
                 entry["is_duplicate"] = True
@@ -265,26 +273,25 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
                 log.info("dedup.duplicate_found", layer=2, duplicate_of=candidate)
                 continue
 
-        # --- Layer 3: SimHash (near-duplicate) --------------------------
-        # Skip when no text was extracted — SimHash of empty text is
-        # identical for all no-text files, causing false near-duplicates.
-        simhash_match = (
-            _find_simhash_match(sim_hash, structural_fp, id_tokens, kept_entries)
+        # --- Layer 3: MinHash + LSH (near-duplicate) --------------------
+        minhash_match = (
+            _find_minhash_match(minhash, structural_fp, id_tokens, lsh, kept_metadata)
             if has_text
             else None
         )
-        if simhash_match is not None:
+        if minhash_match is not None:
             entry["is_duplicate"] = True
-            entry["duplicate_of"] = simhash_match
+            entry["duplicate_of"] = minhash_match
             entry["dedup_layer"] = 3
-            log.info("dedup.duplicate_found", layer=3, duplicate_of=simhash_match)
+            log.info("dedup.duplicate_found", layer=3, duplicate_of=minhash_match)
             continue
 
         # --- File is unique: record it -----------------------------------
         seen_file_hashes[file_hash] = fp
         if has_text:
             seen_content_hashes[content_hash] = fp
-        kept_entries.append((fp, sim_hash, structural_fp, id_tokens))
+            lsh.insert(fp, minhash)
+        kept_metadata[fp] = (structural_fp, id_tokens)
         entry["is_duplicate"] = False
         unique.append(entry)
         log.info("dedup.unique", file_path=fp)
@@ -307,10 +314,10 @@ def _identity_match(
     structural_fp: str,
     id_tokens: str,
     original_path: str,
-    kept: list[tuple[str, int, str, str]],
+    kept_metadata: dict[str, tuple[str, str]],
 ) -> bool:
     """Return True if the candidate document matches the identity of the
-    entry at *original_path* in *kept*.
+    entry at *original_path* in *kept_metadata*.
 
     Checks two layers of identity:
     1. Structural fingerprint (doc_type + date + parties) — from metadata.
@@ -322,54 +329,73 @@ def _identity_match(
     source provides distinguishing information, treat as matching (return
     True) to allow dedup.
     """
+    if original_path not in kept_metadata:
+        return True
+
+    kept_sfp, kept_tokens = kept_metadata[original_path]
     empty_fp = compute_structural_fingerprint("", "", [])
 
-    for path, _, kept_sfp, kept_tokens in kept:
-        if path == original_path:
-            # Check structural fingerprint first (strongest signal)
-            if kept_sfp != empty_fp and structural_fp != empty_fp:
-                return kept_sfp == structural_fp
+    # Check structural fingerprint first (strongest signal)
+    if kept_sfp != empty_fp and structural_fp != empty_fp:
+        return kept_sfp == structural_fp
 
-            # Fall back to identity tokens
-            if kept_tokens and id_tokens:
-                return kept_tokens == id_tokens
+    # Fall back to identity tokens
+    if kept_tokens and id_tokens:
+        return kept_tokens == id_tokens
 
-            # No distinguishing metadata at all — treat as match
-            return True
-
-    # Original not yet in kept (shouldn't happen for L1/L2); treat as match
+    # No distinguishing metadata at all — treat as match
     return True
 
 
-def _find_simhash_match(
-    sim_hash: int,
+def _find_minhash_match(
+    minhash: MinHash,
     structural_fp: str,
     id_tokens: str,
-    kept: list[tuple[str, int, str, str]],
+    lsh: MinHashLSH,
+    kept_metadata: dict[str, tuple[str, str]],
 ) -> str | None:
-    """Return the file_path of the first kept entry whose SimHash is within
-    *SIMHASH_THRESHOLD* Hamming distance **and** whose identity matches.
+    """Query the LSH index for candidate near-duplicates, then post-filter
+    through identity checks.
 
-    Identity is checked via structural fingerprint first, then identity
-    tokens.  Returns ``None`` when no match is found.
+    Returns the file_path of the first matching candidate, or None.
+    """
+    candidates = lsh.query(minhash)
+    return _find_identity_match_in_candidates(
+        candidates, structural_fp, id_tokens, kept_metadata
+    )
+
+
+def _find_identity_match_in_candidates(
+    candidates: list[str],
+    structural_fp: str,
+    id_tokens: str,
+    kept_metadata: dict[str, tuple[str, str]],
+) -> str | None:
+    """Post-filter LSH candidates through identity checks.
+
+    Returns the first candidate whose identity matches, or None.
     """
     empty_fp = compute_structural_fingerprint("", "", [])
 
-    for path, kept_hash, kept_sfp, kept_tokens in kept:
-        if hamming_distance(sim_hash, kept_hash) <= SIMHASH_THRESHOLD:
-            # Check structural fingerprint (strongest signal)
-            if kept_sfp != empty_fp and structural_fp != empty_fp:
-                if kept_sfp == structural_fp:
-                    return path
-                continue  # Different structural identity
+    for candidate_path in candidates:
+        if candidate_path not in kept_metadata:
+            continue
 
-            # Fall back to identity tokens
-            if kept_tokens and id_tokens:
-                if kept_tokens == id_tokens:
-                    return path
-                continue  # Different identity tokens
+        kept_sfp, kept_tokens = kept_metadata[candidate_path]
 
-            # No distinguishing metadata — treat as match
-            return path
+        # Check structural fingerprint (strongest signal)
+        if kept_sfp != empty_fp and structural_fp != empty_fp:
+            if kept_sfp == structural_fp:
+                return candidate_path
+            continue  # Different structural identity
+
+        # Fall back to identity tokens
+        if kept_tokens and id_tokens:
+            if kept_tokens == id_tokens:
+                return candidate_path
+            continue  # Different identity tokens
+
+        # No distinguishing metadata — treat as match
+        return candidate_path
 
     return None
