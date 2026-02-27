@@ -45,6 +45,11 @@ function App() {
   }, []);
 
   const fetchReport = useCallback(async () => {
+    if (!selectedOrg) {
+      setReport(null);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -91,10 +96,10 @@ function App() {
     const res = await fetch('/api/database', { method: 'DELETE' });
     if (!res.ok) throw new Error('Failed to clear database');
     setOrganizations([]);
-    setSelectedOrg('demo-org');
+    setSelectedOrg('');
     setReport(null);
-    fetchReport();
-  }, [fetchReport]);
+    setLoading(false);
+  }, []);
 
   const tabs: { id: Tab; label: string; icon: typeof Table2 }[] = [
     { id: 'obligations', label: 'Obligations', icon: Table2 },
