@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import re
 import string
+from concurrent.futures import ThreadPoolExecutor
 
 import structlog
 from datasketch import MinHash, MinHashLSH
@@ -441,6 +442,42 @@ def deduplicate_files(
     if not files:
         return []
 
+    # ------------------------------------------------------------------
+    # Phase 1: Parallel preprocessing — compute all hashes + extract text
+    # ------------------------------------------------------------------
+
+    def _preprocess_file(entry: dict) -> dict:
+        """Compute all hashes and extract text for one file. Thread-safe."""
+        fp = entry["file_path"]
+        file_hash = compute_file_hash(fp)
+        text = extract_text(fp)
+        has_text = len(text.strip()) >= MIN_TEXT_LENGTH
+        content_hash = compute_content_hash(text)
+        minhash = compute_minhash(text, num_perm=num_perm)
+        id_tokens = extract_identity_tokens(text) if has_text else ""
+
+        doc_type = entry.get("doc_type", "")
+        date = entry.get("date", "")
+        parties = entry.get("parties", [])
+        structural_fp = compute_structural_fingerprint(doc_type, date, parties)
+
+        entry["file_hash"] = file_hash
+        entry["content_hash"] = content_hash
+        entry["minhash_signature"] = minhash.hashvalues.tobytes().hex()
+        entry["identity_tokens"] = id_tokens
+        entry["structural_fingerprint"] = structural_fp
+        entry["_text"] = text
+        entry["_has_text"] = has_text
+        entry["_minhash"] = minhash
+        return entry
+
+    with ThreadPoolExecutor(max_workers=min(8, len(files))) as pool:
+        files = list(pool.map(_preprocess_file, files))
+
+    # ------------------------------------------------------------------
+    # Phase 2: Sequential comparison (uses accumulated state)
+    # ------------------------------------------------------------------
+
     # Accumulators keyed by hash/fingerprint -> first file_path seen
     seen_file_hashes: dict[str, str] = {}
     seen_content_hashes: dict[str, str] = {}
@@ -459,26 +496,13 @@ def deduplicate_files(
         fp = entry["file_path"]
         log = logger.bind(file_path=fp)
 
-        # --- Compute fingerprints ----------------------------------------
-        file_hash = compute_file_hash(fp)
-        entry["file_hash"] = file_hash
-
-        text = extract_text(fp)
-        has_text = len(text.strip()) >= MIN_TEXT_LENGTH
-        content_hash = compute_content_hash(text)
-        entry["content_hash"] = content_hash
-
-        minhash = compute_minhash(text, num_perm=num_perm)
-        entry["minhash_signature"] = minhash.hashvalues.tobytes().hex()
-
-        id_tokens = extract_identity_tokens(text) if has_text else ""
-        entry["identity_tokens"] = id_tokens
-
-        doc_type = entry.get("doc_type", "")
-        date = entry.get("date", "")
-        parties = entry.get("parties", [])
-        structural_fp = compute_structural_fingerprint(doc_type, date, parties)
-        entry["structural_fingerprint"] = structural_fp
+        # Retrieve precomputed values.
+        file_hash = entry["file_hash"]
+        text = entry.pop("_text")
+        has_text = entry.pop("_has_text")
+        content_hash = entry["content_hash"]
+        minhash = entry.pop("_minhash")
+        structural_fp = entry["structural_fingerprint"]
 
         # Cache text for lazy blocking key extraction
         if has_text:

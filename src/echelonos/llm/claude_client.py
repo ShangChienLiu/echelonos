@@ -10,6 +10,7 @@ import json
 
 import anthropic
 import structlog
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from echelonos.config import settings
 
@@ -20,6 +21,12 @@ def get_anthropic_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
 
+@retry(
+    retry=retry_if_exception_type((anthropic.RateLimitError, anthropic.APIConnectionError)),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    reraise=True,
+)
 def extract_with_structured_output(
     client: anthropic.Anthropic,
     system_prompt: str,

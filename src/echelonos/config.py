@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     # File storage
     upload_dir: str = "data/uploads"
 
+    # Concurrency
+    pipeline_max_workers: int = 5       # Max parallel documents for stages 1-3
+    stage3_max_cove_workers: int = 4    # Max parallel CoVe verifications
+
     @property
     def database_url(self) -> str:
         return (

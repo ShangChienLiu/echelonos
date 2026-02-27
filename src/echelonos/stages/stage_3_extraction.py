@@ -23,10 +23,12 @@ the combined results of these checks.
 from __future__ import annotations
 
 import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import structlog
 from pydantic import BaseModel
 
+from echelonos.config import settings
 from echelonos.llm.claude_client import extract_with_structured_output, get_anthropic_client
 
 log = structlog.get_logger(__name__)
@@ -540,13 +542,16 @@ def extract_and_verify(
     # Step 1: Extract party roles.
     party_roles = extract_party_roles(text, claude_client=claude_client)
 
-    # Step 2: Run both extractions independently.
-    primary_extraction = extract_obligations(
-        text, party_roles, claude_client=claude_client
-    )
-    independent_extraction = extract_obligations_independent(
-        text, party_roles, claude_client=claude_client
-    )
+    # Step 2: Run both extractions independently (in parallel).
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_primary = pool.submit(
+            extract_obligations, text, party_roles, claude_client=claude_client
+        )
+        f_independent = pool.submit(
+            extract_obligations_independent, text, party_roles, claude_client=claude_client
+        )
+        primary_extraction = f_primary.result()
+        independent_extraction = f_independent.result()
 
     # Step 3: Match obligations from both extractions.
     pairs = match_extractions(
@@ -554,16 +559,17 @@ def extract_and_verify(
         independent_extraction.obligations,
     )
 
-    results: list[dict] = []
+    # First pass: determine agreement + grounding for all pairs, collect CoVe work.
+    pair_info: list[dict] = []
+    cove_work: list[tuple[int, Obligation]] = []  # (index, obligation)
 
-    for primary_obl, independent_obl in pairs:
+    for idx, (primary_obl, independent_obl) in enumerate(pairs):
         log.info(
             "verifying_obligation",
             obligation=primary_obl.obligation_text[:80],
             has_match=independent_obl is not None,
         )
 
-        # Determine agreement status.
         if independent_obl is None:
             agreement = "SOLO"
         elif check_agreement(primary_obl, independent_obl):
@@ -571,15 +577,40 @@ def extract_and_verify(
         else:
             agreement = "DISAGREED"
 
-        # Grounding check (always on primary obligation).
         grounded = verify_grounding(primary_obl, text)
 
-        # CoVe arbitration for DISAGREED / SOLO.
-        cove_result = None
-        if agreement in ("DISAGREED", "SOLO"):
-            cove_result = run_cove(primary_obl, text, claude_client=claude_client)
+        pair_info.append({
+            "primary_obl": primary_obl,
+            "independent_obl": independent_obl,
+            "agreement": agreement,
+            "grounded": grounded,
+            "cove_result": None,
+        })
 
-        # Determine final status.
+        if agreement in ("DISAGREED", "SOLO"):
+            cove_work.append((idx, primary_obl))
+
+    # Parallel CoVe arbitration for all DISAGREED / SOLO obligations.
+    if cove_work:
+        max_cove = settings.stage3_max_cove_workers
+        with ThreadPoolExecutor(max_workers=max_cove) as pool:
+            futures = {
+                pool.submit(run_cove, obl, text, claude_client=claude_client): idx
+                for idx, obl in cove_work
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                pair_info[idx]["cove_result"] = future.result()
+
+    # Assemble final results.
+    results: list[dict] = []
+    for info in pair_info:
+        primary_obl = info["primary_obl"]
+        independent_obl = info["independent_obl"]
+        agreement = info["agreement"]
+        grounded = info["grounded"]
+        cove_result = info["cove_result"]
+
         if agreement == "AGREED" and grounded:
             status = "VERIFIED"
         elif agreement in ("DISAGREED", "SOLO"):
@@ -589,7 +620,6 @@ def extract_and_verify(
             else:
                 status = "UNVERIFIED"
         else:
-            # AGREED but not grounded
             status = "UNVERIFIED"
 
         entry = {

@@ -596,14 +596,119 @@ def stop_pipeline() -> dict:
     return {"status": "ok", "message": "Pipeline cancellation requested"}
 
 
+def _process_document(
+    doc_id,
+    file_path: str,
+    ocr_client,
+    claude_client,
+    session_factory,
+    cancel_event: threading.Event,
+) -> dict:
+    """Process a single document through stages 1-3. Each thread gets its own DB session."""
+    import uuid as _uuid
+
+    from echelonos.db.persist import upsert_obligation, upsert_page
+    from echelonos.stages.stage_1_ocr import ingest_document
+    from echelonos.stages.stage_2_classification import (
+        classify_document,
+        classify_with_cross_check,
+    )
+    from echelonos.stages.stage_3_extraction import extract_and_verify
+
+    db = session_factory()
+    try:
+        if cancel_event.is_set():
+            return {"doc_id": str(doc_id), "status": "cancelled"}
+
+        # Stage 1: OCR
+        ocr_result = ingest_document(
+            file_path=file_path,
+            doc_id=str(doc_id),
+            ocr_client=ocr_client,
+        )
+        for page_data in ocr_result.get("pages", []):
+            upsert_page(
+                db,
+                doc_id=doc_id,
+                page_number=page_data["page_number"],
+                text=page_data.get("text"),
+                tables_markdown=page_data.get("tables_markdown"),
+                ocr_confidence=page_data.get("ocr_confidence"),
+            )
+        db.commit()
+
+        if cancel_event.is_set():
+            return {"doc_id": str(doc_id), "status": "cancelled"}
+
+        # Stage 2: Classification
+        pages = (
+            db.query(Page)
+            .filter(Page.doc_id == doc_id)
+            .order_by(Page.page_number)
+            .all()
+        )
+        full_text = "\n\n".join(p.text or "" for p in pages)
+        if full_text.strip():
+            result = classify_document(full_text, claude_client=claude_client)
+            result = classify_with_cross_check(full_text, result)
+
+            doc = db.query(Document).get(doc_id)
+            doc.doc_type = result.doc_type
+            doc.parties = result.parties
+            doc.effective_date = result.effective_date
+            doc.parent_reference_raw = result.parent_reference_raw
+            doc.classification_confidence = result.confidence
+            db.commit()
+
+        if cancel_event.is_set():
+            return {"doc_id": str(doc_id), "status": "cancelled"}
+
+        # Stage 3: Extraction
+        if full_text.strip():
+            verified = extract_and_verify(full_text, claude_client=claude_client)
+            for item in verified:
+                obl_data = item.get("obligation", {})
+                upsert_obligation(
+                    db,
+                    doc_id=doc_id,
+                    source_clause=obl_data.get("source_clause", ""),
+                    obligation_text=obl_data.get("obligation_text", ""),
+                    obligation_type=obl_data.get("obligation_type"),
+                    responsible_party=obl_data.get("responsible_party"),
+                    counterparty=obl_data.get("counterparty"),
+                    frequency=obl_data.get("frequency"),
+                    deadline=obl_data.get("deadline"),
+                    source_page=obl_data.get("source_page"),
+                    confidence=item.get("claude_verification", {}).get(
+                        "confidence", obl_data.get("confidence")
+                    ),
+                    status=item.get("status", "ACTIVE"),
+                    verification_result=item.get("claude_verification"),
+                )
+            db.commit()
+
+        return {"doc_id": str(doc_id), "status": "ok"}
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Processing failed for doc %s", doc_id)
+        return {"doc_id": str(doc_id), "status": "error", "error": str(exc)}
+    finally:
+        if _test_session_factory is None:
+            db.close()
+
+
 def _run_pipeline_background(org_name: str, org_id: str) -> None:
     """Execute stages 1-7 in a background thread.
 
-    Creates its own DB session (thread-safe) and LLM clients.
+    Stages 1-3 are fused per document and parallelized across documents.
+    Stages 4-7 remain sequential as they require cross-document state.
     Checks ``_cancel_event`` between stages and between documents.
     """
     import uuid as _uuid
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from echelonos.config import settings
     from echelonos.db.persist import (
         upsert_document,
         upsert_document_link,
@@ -612,10 +717,12 @@ def _run_pipeline_background(org_name: str, org_id: str) -> None:
     )
 
     if _test_session_factory is not None:
-        db = _test_session_factory()
+        session_factory = _test_session_factory
     else:
         from echelonos.db.session import SessionLocal
-        db = SessionLocal()
+        session_factory = SessionLocal
+
+    db = session_factory()
 
     try:
         # Load clients once.
@@ -632,133 +739,50 @@ def _run_pipeline_background(org_name: str, org_id: str) -> None:
         _pipeline_status["total_docs"] = total
         _pipeline_status["processed_docs"] = 0
 
-        # ---- Stage 1: OCR ----
+        # ---- Stages 1-3: Fused parallel per-document pipeline ----
         if _cancel_event.is_set():
             return
-        _set_stage("stage_1", "Stage 1: OCR — Extracting text")
-
-        from echelonos.stages.stage_1_ocr import ingest_document
-
-        for i, doc in enumerate(docs):
-            if _cancel_event.is_set():
-                return
-            try:
-                ocr_result = ingest_document(
-                    file_path=doc.file_path,
-                    doc_id=str(doc.id),
-                    ocr_client=ocr_client,
-                )
-                for page_data in ocr_result.get("pages", []):
-                    upsert_page(
-                        db,
-                        doc_id=doc.id,
-                        page_number=page_data["page_number"],
-                        text=page_data.get("text"),
-                        tables_markdown=page_data.get("tables_markdown"),
-                        ocr_confidence=page_data.get("ocr_confidence"),
-                    )
-                db.commit()
-            except Exception:
-                db.rollback()
-                logger.exception("OCR failed for doc %s", doc.id)
-            _pipeline_status["processed_docs"] = i + 1
-
-        _complete_stage("OCR")
-
-        # ---- Stage 2: Classification ----
-        if _cancel_event.is_set():
-            return
-        _set_stage("stage_2", "Stage 2: Classification")
-        _pipeline_status["processed_docs"] = 0
-
-        from echelonos.stages.stage_2_classification import (
-            classify_document,
-            classify_with_cross_check,
+        _set_stage(
+            "stage_1_2_3",
+            f"Stages 1-3: OCR → Classification → Extraction (0/{total})",
         )
 
-        for i, doc in enumerate(docs):
-            if _cancel_event.is_set():
-                return
-            try:
-                # Gather text from pages.
-                pages = (
-                    db.query(Page)
-                    .filter(Page.doc_id == doc.id)
-                    .order_by(Page.page_number)
-                    .all()
-                )
-                full_text = "\n\n".join(p.text or "" for p in pages)
-                if not full_text.strip():
-                    _pipeline_status["processed_docs"] = i + 1
-                    continue
+        processed = 0
+        lock = threading.Lock()
 
-                result = classify_document(full_text, claude_client=claude_client)
-                result = classify_with_cross_check(full_text, result)
-
-                # Update document fields.
-                doc.doc_type = result.doc_type
-                doc.parties = result.parties
-                doc.effective_date = result.effective_date
-                doc.parent_reference_raw = result.parent_reference_raw
-                doc.classification_confidence = result.confidence
-                db.commit()
-            except Exception:
-                db.rollback()
-                logger.exception("Classification failed for doc %s", doc.id)
-            _pipeline_status["processed_docs"] = i + 1
-
-        _complete_stage("Classification")
-
-        # ---- Stage 3: Extraction ----
-        if _cancel_event.is_set():
-            return
-        _set_stage("stage_3", "Stage 3: Obligation Extraction")
-        _pipeline_status["processed_docs"] = 0
-
-        from echelonos.stages.stage_3_extraction import extract_and_verify
-
-        for i, doc in enumerate(docs):
-            if _cancel_event.is_set():
-                return
-            try:
-                pages = (
-                    db.query(Page)
-                    .filter(Page.doc_id == doc.id)
-                    .order_by(Page.page_number)
-                    .all()
-                )
-                full_text = "\n\n".join(p.text or "" for p in pages)
-                if not full_text.strip():
-                    _pipeline_status["processed_docs"] = i + 1
-                    continue
-
-                verified = extract_and_verify(full_text, claude_client=claude_client)
-                for item in verified:
-                    obl_data = item.get("obligation", {})
-                    upsert_obligation(
-                        db,
-                        doc_id=doc.id,
-                        source_clause=obl_data.get("source_clause", ""),
-                        obligation_text=obl_data.get("obligation_text", ""),
-                        obligation_type=obl_data.get("obligation_type"),
-                        responsible_party=obl_data.get("responsible_party"),
-                        counterparty=obl_data.get("counterparty"),
-                        frequency=obl_data.get("frequency"),
-                        deadline=obl_data.get("deadline"),
-                        source_page=obl_data.get("source_page"),
-                        confidence=item.get("claude_verification", {}).get(
-                            "confidence", obl_data.get("confidence")
-                        ),
-                        status=item.get("status", "ACTIVE"),
-                        verification_result=item.get("claude_verification"),
+        with ThreadPoolExecutor(max_workers=settings.pipeline_max_workers) as pool:
+            futures = {
+                pool.submit(
+                    _process_document,
+                    doc.id,
+                    doc.file_path,
+                    ocr_client,
+                    claude_client,
+                    session_factory,
+                    _cancel_event,
+                ): doc
+                for doc in docs
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                with lock:
+                    processed += 1
+                    _pipeline_status["processed_docs"] = processed
+                    _pipeline_status["current_stage_label"] = (
+                        f"Stages 1-3: OCR → Classification → Extraction ({processed}/{total})"
                     )
-                db.commit()
-            except Exception:
-                db.rollback()
-                logger.exception("Extraction failed for doc %s", doc.id)
-            _pipeline_status["processed_docs"] = i + 1
+                if _cancel_event.is_set():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return
 
+        _complete_stage("OCR")
+        _complete_stage("Classification")
         _complete_stage("Extraction")
+
+        # Refresh docs from DB for subsequent stages (they may have been
+        # updated by worker threads in their own sessions).
+        db.expire_all()
+        docs = db.query(Document).filter(Document.org_id == org_uuid).all()
 
         # ---- Stage 4: Linking ----
         if _cancel_event.is_set():

@@ -5,7 +5,12 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from echelonos.config import settings
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=10,
+)
 SessionLocal = sessionmaker(bind=engine)
 
 
