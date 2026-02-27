@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: echelonos
+      POSTGRES_USER: echelonos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-echelonos_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U echelonos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  prefect-server:
+    image: prefecthq/prefect:3-python3.11
+    command: prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://echelonos:${POSTGRES_PASSWORD:-echelonos_dev}@postgres:5432/prefect
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
