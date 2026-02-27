@@ -4,6 +4,8 @@
 
 When fixing bugs or creating new features, **always** git commit and git push to the GitHub repository. Every meaningful change should be committed with a clear message and pushed immediately.
 
+**Do NOT add `Co-Authored-By` lines to commit messages.**
+
 ## 2. Bug Fix Workflow: E2E Tests First
 
 When fixing bugs:
