@@ -402,21 +402,21 @@ def build_summary(
 
     Returns
     -------
-    dict with keys ``by_type``, ``by_status``, ``by_party``,
+    dict with keys ``by_type``, ``by_status``, ``by_responsible_party``,
     ``flags_by_severity``, ``flags_by_type``.
     """
     log.info("building_summary")
 
     by_type: dict[str, int] = dict(Counter(r.obligation_type for r in obligations))
     by_status: dict[str, int] = dict(Counter(r.status for r in obligations))
-    by_party: dict[str, int] = dict(Counter(r.responsible_party for r in obligations))
+    by_responsible_party: dict[str, int] = dict(Counter(r.responsible_party for r in obligations))
     flags_by_severity: dict[str, int] = dict(Counter(f.severity for f in flags))
     flags_by_type: dict[str, int] = dict(Counter(f.flag_type for f in flags))
 
     summary = {
         "by_type": by_type,
         "by_status": by_status,
-        "by_party": by_party,
+        "by_responsible_party": by_responsible_party,
         "flags_by_severity": flags_by_severity,
         "flags_by_type": flags_by_type,
     }
@@ -620,10 +620,10 @@ def export_to_markdown(report: ObligationReport) -> str:
             lines.append(f"- {key}: {count}")
         lines.append("")
 
-    if summary.get("by_party"):
+    if summary.get("by_responsible_party"):
         lines.append("### By Responsible Party")
         lines.append("")
-        for key, count in sorted(summary["by_party"].items()):
+        for key, count in sorted(summary["by_responsible_party"].items()):
             lines.append(f"- {key}: {count}")
         lines.append("")
 

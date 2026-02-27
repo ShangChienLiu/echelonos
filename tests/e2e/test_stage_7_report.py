@@ -432,6 +432,35 @@ class TestBuildFlagReportLowConfidence:
 class TestBuildSummary:
     """Correct aggregation counts."""
 
+    def test_summary_uses_by_responsible_party_key(self):
+        """The summary must use 'by_responsible_party' (not 'by_party') so
+        the frontend SummaryData interface can consume it without errors."""
+        rows = [
+            ObligationRow(
+                number=1,
+                obligation_text="Deliver reports",
+                obligation_type="Delivery",
+                responsible_party="Vendor",
+                counterparty="Client",
+                source="SOW",
+                status="ACTIVE",
+                confidence=0.95,
+            ),
+        ]
+        flags: list[FlagItem] = []
+
+        summary = build_summary(rows, flags)
+
+        assert "by_responsible_party" in summary, (
+            "build_summary must return 'by_responsible_party' key to match "
+            "the frontend SummaryData interface; got keys: "
+            + str(list(summary.keys()))
+        )
+        assert "by_party" not in summary, (
+            "'by_party' key should be renamed to 'by_responsible_party'"
+        )
+        assert summary["by_responsible_party"]["Vendor"] == 1
+
     def test_build_summary(self):
         rows = [
             ObligationRow(
@@ -501,8 +530,8 @@ class TestBuildSummary:
         assert summary["by_status"]["SUPERSEDED"] == 1
 
         # By party.
-        assert summary["by_party"]["Vendor"] == 2
-        assert summary["by_party"]["Client"] == 1
+        assert summary["by_responsible_party"]["Vendor"] == 2
+        assert summary["by_responsible_party"]["Client"] == 1
 
         # Flags by severity.
         assert summary["flags_by_severity"]["RED"] == 1
@@ -579,7 +608,7 @@ class TestGenerateReportComplete:
 
         assert "by_type" in report.summary
         assert "by_status" in report.summary
-        assert "by_party" in report.summary
+        assert "by_responsible_party" in report.summary
         assert "flags_by_severity" in report.summary
         assert "flags_by_type" in report.summary
 
@@ -754,6 +783,6 @@ class TestEmptyObligations:
 
         assert report.summary["by_type"] == {}
         assert report.summary["by_status"] == {}
-        assert report.summary["by_party"] == {}
+        assert report.summary["by_responsible_party"] == {}
         assert report.summary["flags_by_severity"] == {}
         assert report.summary["flags_by_type"] == {}
