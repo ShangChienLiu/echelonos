@@ -196,6 +196,7 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
         entry["file_hash"] = file_hash
 
         text = extract_text(fp)
+        has_text = bool(text.strip())
         content_hash = compute_content_hash(text)
         entry["content_hash"] = content_hash
 
@@ -222,7 +223,9 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
                 continue
 
         # --- Layer 2: content hash --------------------------------------
-        if content_hash in seen_content_hashes:
+        # Skip when no text was extracted (e.g. scanned PDFs, images) to
+        # avoid treating every no-text file as a duplicate of the first.
+        if has_text and content_hash in seen_content_hashes:
             candidate = seen_content_hashes[content_hash]
             if not _structural_match(structural_fp, candidate, kept_simhashes):
                 log.info("dedup.layer4_protected", layer=2, candidate=candidate)
@@ -234,7 +237,13 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
                 continue
 
         # --- Layer 3: SimHash (near-duplicate) --------------------------
-        simhash_match = _find_simhash_match(sim_hash, structural_fp, kept_simhashes)
+        # Skip when no text was extracted — SimHash of empty text is
+        # identical for all no-text files, causing false near-duplicates.
+        simhash_match = (
+            _find_simhash_match(sim_hash, structural_fp, kept_simhashes)
+            if has_text
+            else None
+        )
         if simhash_match is not None:
             entry["is_duplicate"] = True
             entry["duplicate_of"] = simhash_match
@@ -244,7 +253,8 @@ def deduplicate_files(files: list[dict]) -> list[dict]:
 
         # --- File is unique: record it -----------------------------------
         seen_file_hashes[file_hash] = fp
-        seen_content_hashes[content_hash] = fp
+        if has_text:
+            seen_content_hashes[content_hash] = fp
         kept_simhashes.append((fp, sim_hash, structural_fp))
         entry["is_duplicate"] = False
         unique.append(entry)

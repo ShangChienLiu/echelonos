@@ -98,6 +98,31 @@ def _make_docx(path: Path, text: str) -> Path:
     return path
 
 
+def _write_pdf_no_text(folder: Path, name: str, extra_byte: bytes = b"") -> Path:
+    """Write a minimal valid PDF with NO text content (simulates scanned PDF).
+
+    Each call with different *extra_byte* produces a different file hash.
+    """
+    # A valid PDF with an empty content stream — pypdf extracts "".
+    content = (
+        b"%PDF-1.4\n"
+        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+        b"3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\n"
+        b"xref\n0 4\n"
+        b"0000000000 65535 f \n"
+        b"0000000009 00000 n \n"
+        b"0000000058 00000 n \n"
+        b"0000000115 00000 n \n"
+        b"trailer<</Size 4/Root 1 0 R>>\n"
+        b"startxref\n175\n%%EOF"
+        + extra_byte
+    )
+    path = folder / name
+    path.write_bytes(content)
+    return path
+
+
 def _entry(file_path: str, **kwargs) -> dict:
     """Build a minimal file entry dict for ``deduplicate_files``."""
     base = {"file_path": file_path, "status": "VALID"}
@@ -261,6 +286,34 @@ class TestUniqueFilesPass:
         assert len(unique) == 3
         for f in unique:
             assert f["is_duplicate"] is False
+
+
+class TestScannedPdfsNotDeduplicated:
+    """Scanned PDFs (no extractable text) should NOT be collapsed as duplicates.
+
+    When pypdf extracts zero text from a scanned PDF, the content hash is
+    the hash of an empty string.  Layer 2/3 must skip files with no
+    extractable text to avoid treating every scanned PDF as a duplicate.
+    """
+
+    def test_different_scanned_pdfs_kept_as_unique(self, tmp_org_folder: Path) -> None:
+        """Three scanned PDFs (different file bytes, no text) should all be kept.
+
+        Each file differs in raw bytes (different extra_byte) so Layer 1
+        won't catch them.  Layer 2/3 must not collapse them because no
+        text was extracted.
+        """
+        _write_pdf_no_text(tmp_org_folder, "scan_a.pdf", extra_byte=b"A")
+        _write_pdf_no_text(tmp_org_folder, "scan_b.pdf", extra_byte=b"B")
+        _write_pdf_no_text(tmp_org_folder, "scan_c.pdf", extra_byte=b"C")
+
+        files = [
+            {"file_path": str(tmp_org_folder / n), "status": "VALID"}
+            for n in ("scan_a.pdf", "scan_b.pdf", "scan_c.pdf")
+        ]
+        result = deduplicate_files(files)
+        # All 3 have different bytes — should be unique
+        assert len(result) == 3, f"Expected 3 unique, got {len(result)}"
 
 
 class TestEmptyInput:
