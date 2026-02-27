@@ -352,7 +352,10 @@ def extract_blocking_keys(
 def _regex_fallback_blocking_keys(text: str) -> BlockingKeyFields | None:
     """Extract blocking keys using regex patterns when Claude is unavailable.
 
-    Uses existing regex patterns to populate BlockingKeyFields as best-effort.
+    Uses the full sorted identity token set as the po_number field so that
+    documents with different token bags (different PO numbers, amounts, or
+    dates) produce different blocking keys.  This preserves the protection
+    behavior of the old identity-token comparison.
     """
     if not text or len(text.strip()) < MIN_TEXT_LENGTH:
         return None
@@ -364,8 +367,13 @@ def _regex_fallback_blocking_keys(text: str) -> BlockingKeyFields | None:
     if not numbers and not amounts and not dates:
         return None
 
+    # Use full sorted token set as po_number to preserve old identity-token
+    # comparison semantics: any difference in numbers/amounts/dates → protect.
+    all_tokens = sorted(set(numbers + amounts + dates))
+    token_string = "|".join(all_tokens)
+
     return BlockingKeyFields(
-        po_number=numbers[0] if numbers else None,
+        po_number=token_string,
         total_amount=amounts[0] if amounts else None,
         document_date=dates[0] if dates else None,
     )
