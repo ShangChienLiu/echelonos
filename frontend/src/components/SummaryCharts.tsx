@@ -57,7 +57,7 @@ function HorizontalBarChart({
           return (
             <div key={label}>
               <div className="flex items-center justify-between mb-1">
-                <span className="text-xs font-medium text-slate-600 truncate max-w-[160px]">
+                <span className="text-xs font-medium text-slate-600 truncate max-w-[160px]" title={label}>
                   {label}
                 </span>
                 <span className="text-xs font-semibold text-slate-800 ml-2">{count}</span>
