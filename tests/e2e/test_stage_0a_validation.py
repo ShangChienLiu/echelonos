@@ -614,6 +614,33 @@ class TestValidateFolder:
         assert len(results) == 1
         assert results[0]["status"] == "VALID"
 
+    def test_container_extraction_does_not_pollute_source_folder(
+        self, tmp_org_folder: Path, sample_pdf: Path
+    ) -> None:
+        """Container extraction (MSG/EML/ZIP) must NOT create _extracted_*
+        directories inside the source folder.  Running validate_folder twice
+        must produce the same file count (idempotent).
+        """
+        # Create a zip container so extraction is triggered
+        zip_path = tmp_org_folder / "bundle.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("inner.txt", "hello from inside the zip")
+
+        results_1 = validate_folder(str(tmp_org_folder))
+        results_2 = validate_folder(str(tmp_org_folder))
+
+        # No _extracted_* directories should exist in the source folder
+        extracted_dirs = list(tmp_org_folder.glob("_extracted_*"))
+        assert extracted_dirs == [], (
+            f"validate_folder created directories in source folder: {extracted_dirs}"
+        )
+
+        # Running twice must give the same count (idempotent)
+        assert len(results_1) == len(results_2), (
+            f"Non-idempotent: first run found {len(results_1)} files, "
+            f"second run found {len(results_2)}"
+        )
+
     def test_folder_validation_recursive(self, tmp_org_folder: Path) -> None:
         """Files inside sub-directories should also be discovered."""
         sub = tmp_org_folder / "subdir"

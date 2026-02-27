@@ -19,6 +19,7 @@ import email
 import os
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from html.parser import HTMLParser
 from io import StringIO
@@ -745,9 +746,11 @@ def validate_file(file_path: str, extracted_from: str | None = None) -> dict:
 
     # --- CONTAINER formats ------------------------------------------------
     if category == "container":
-        # Create a sub-directory for extracted children.
+        # Extract children into a temp directory (not the source folder)
+        # to avoid polluting the original folder and inflating file counts
+        # on subsequent runs.
         parent_stem = Path(file_path).stem
-        extraction_dir = str(Path(file_path).parent / f"_extracted_{parent_stem}")
+        extraction_dir = tempfile.mkdtemp(prefix=f"_extracted_{parent_stem}_")
         parent_name = Path(file_path).name
 
         child_paths: list[str] = []
@@ -973,8 +976,12 @@ def validate_folder(folder_path: str) -> list[dict]:
         return results
 
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune macOS metadata directories in-place so os.walk skips them.
-        dirnames[:] = [d for d in dirnames if d not in _MACOS_JUNK_DIRS]
+        # Prune macOS metadata and leftover extraction directories in-place
+        # so os.walk skips them.
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _MACOS_JUNK_DIRS and not d.startswith("_extracted_")
+        ]
         for fname in sorted(filenames):
             full_path = os.path.join(dirpath, fname)
             if _is_macos_junk(full_path):
