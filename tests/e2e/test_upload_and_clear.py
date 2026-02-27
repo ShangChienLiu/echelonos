@@ -164,7 +164,7 @@ class TestPipelineStatus:
         assert resp.status_code == 200
         data = resp.json()
         assert "state" in data
-        assert data["state"] in ("idle", "processing", "done", "error")
+        assert data["state"] in ("idle", "processing", "done", "error", "cancelled")
 
 
 # ---------------------------------------------------------------------------

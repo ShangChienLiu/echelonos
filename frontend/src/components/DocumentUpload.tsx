@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import {
   Upload,
   FileText,
@@ -9,8 +9,12 @@ import {
   Loader2,
   Trash2,
   FolderArchive,
+  Play,
+  Square,
+  AlertTriangle,
 } from 'lucide-react';
 import clsx from 'clsx';
+import type { PipelineStatus } from '../types';
 
 interface PipelineResult {
   status: string;
@@ -26,9 +30,10 @@ interface PipelineResult {
 interface DocumentUploadProps {
   onUploadComplete: () => void;
   onClearDatabase: () => Promise<void>;
+  selectedOrg: string;
 }
 
-export default function DocumentUpload({ onUploadComplete, onClearDatabase }: DocumentUploadProps) {
+export default function DocumentUpload({ onUploadComplete, onClearDatabase, selectedOrg }: DocumentUploadProps) {
   const [files, setFiles] = useState<File[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -38,6 +43,59 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
   const [elapsed, setElapsed] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Pipeline run/stop state
+  const [pipelineStatus, setPipelineStatus] = useState<PipelineStatus | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  const startPolling = useCallback(() => {
+    stopPolling();
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/pipeline/status');
+        if (res.ok) {
+          const data: PipelineStatus = await res.json();
+          setPipelineStatus(data);
+          if (data.state !== 'processing') {
+            stopPolling();
+            if (data.state === 'done') {
+              onUploadComplete();
+            }
+          }
+        }
+      } catch {
+        // ignore network errors during polling
+      }
+    };
+    poll(); // immediate first check
+    pollRef.current = setInterval(poll, 1500);
+  }, [stopPolling, onUploadComplete]);
+
+  // On mount, check if pipeline is already running and resume polling
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/pipeline/status');
+        if (res.ok) {
+          const data: PipelineStatus = await res.json();
+          setPipelineStatus(data);
+          if (data.state === 'processing') {
+            startPolling();
+          }
+        }
+      } catch {
+        // API not available
+      }
+    })();
+    return () => stopPolling();
+  }, [startPolling, stopPolling]);
 
   const addFiles = useCallback((incoming: FileList | File[]) => {
     const arr = Array.from(incoming);
@@ -105,6 +163,52 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
     }
   }, [files, onUploadComplete, startTimer, stopTimer]);
 
+  const handleRunPipeline = useCallback(async () => {
+    if (!selectedOrg) return;
+    setPipelineStatus(null);
+    try {
+      const res = await fetch(`/api/pipeline/run?org_name=${encodeURIComponent(selectedOrg)}`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        startPolling();
+      } else {
+        setPipelineStatus({
+          state: 'error',
+          org_name: selectedOrg,
+          current_stage: null,
+          current_stage_label: null,
+          total_docs: 0,
+          processed_docs: 0,
+          stages_completed: [],
+          elapsed_seconds: null,
+          error: data.error || 'Failed to start pipeline',
+        });
+      }
+    } catch (err) {
+      setPipelineStatus({
+        state: 'error',
+        org_name: selectedOrg,
+        current_stage: null,
+        current_stage_label: null,
+        total_docs: 0,
+        processed_docs: 0,
+        stages_completed: [],
+        elapsed_seconds: null,
+        error: String(err),
+      });
+    }
+  }, [selectedOrg, startPolling]);
+
+  const handleStopPipeline = useCallback(async () => {
+    try {
+      await fetch('/api/pipeline/stop', { method: 'POST' });
+    } catch {
+      // ignore
+    }
+  }, []);
+
   const handleClear = useCallback(async () => {
     setClearing(true);
     try {
@@ -112,6 +216,7 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
       setConfirmClear(false);
       setResult(null);
       setFiles([]);
+      setPipelineStatus(null);
     } finally {
       setClearing(false);
     }
@@ -125,6 +230,23 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
 
   const hasZip = files.some((f) => f.name.toLowerCase().endsWith('.zip'));
 
+  const isPipelineProcessing = pipelineStatus?.state === 'processing';
+  const isPipelineTerminal =
+    pipelineStatus?.state === 'done' ||
+    pipelineStatus?.state === 'error' ||
+    pipelineStatus?.state === 'cancelled';
+
+  const pipelineDocProgress =
+    pipelineStatus && pipelineStatus.total_docs > 0
+      ? Math.round((pipelineStatus.processed_docs / pipelineStatus.total_docs) * 100)
+      : 0;
+
+  // Stages 1-3 have per-doc progress
+  const showDocProgress =
+    isPipelineProcessing &&
+    pipelineStatus?.current_stage &&
+    ['stage_1', 'stage_2', 'stage_3'].includes(pipelineStatus.current_stage);
+
   return (
     <div className="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
       {/* Card header */}
@@ -134,36 +256,68 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
           <h2 className="text-sm font-semibold text-slate-700">Document Ingestion</h2>
         </div>
 
-        {/* Clear database button — inline in header */}
-        {!confirmClear ? (
-          <button
-            type="button"
-            onClick={() => setConfirmClear(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors cursor-pointer"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            Clear Database
-          </button>
-        ) : (
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-red-600 font-medium">Delete all data?</span>
+        <div className="flex items-center gap-2">
+          {/* Run Pipeline button */}
+          {!isPipelineProcessing && (
             <button
               type="button"
-              onClick={handleClear}
-              disabled={clearing}
-              className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-md hover:bg-red-700 disabled:opacity-50 transition-colors cursor-pointer"
+              onClick={handleRunPipeline}
+              disabled={!selectedOrg || uploading}
+              className={clsx(
+                'flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer',
+                !selectedOrg || uploading
+                  ? 'text-slate-400 bg-slate-100 cursor-not-allowed'
+                  : 'text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200'
+              )}
             >
-              {clearing ? 'Clearing...' : 'Confirm'}
+              <Play className="w-3.5 h-3.5" />
+              Run Pipeline
             </button>
+          )}
+
+          {/* Stop Pipeline button */}
+          {isPipelineProcessing && (
             <button
               type="button"
-              onClick={() => setConfirmClear(false)}
-              className="px-2.5 py-1 text-xs font-medium text-slate-500 bg-slate-100 rounded-md hover:bg-slate-200 transition-colors cursor-pointer"
+              onClick={handleStopPipeline}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-md transition-colors cursor-pointer"
             >
-              Cancel
+              <Square className="w-3.5 h-3.5" />
+              Stop Pipeline
             </button>
-          </div>
-        )}
+          )}
+
+          {/* Clear database button */}
+          {!confirmClear ? (
+            <button
+              type="button"
+              onClick={() => setConfirmClear(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Clear Database
+            </button>
+          ) : (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-red-600 font-medium">Delete all data?</span>
+              <button
+                type="button"
+                onClick={handleClear}
+                disabled={clearing}
+                className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-md hover:bg-red-700 disabled:opacity-50 transition-colors cursor-pointer"
+              >
+                {clearing ? 'Clearing...' : 'Confirm'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmClear(false)}
+                className="px-2.5 py-1 text-xs font-medium text-slate-500 bg-slate-100 rounded-md hover:bg-slate-200 transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Drop zone */}
@@ -282,7 +436,7 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
         </div>
       )}
 
-      {/* Processing timer */}
+      {/* Upload processing timer */}
       {uploading && (
         <div className="mx-5 mb-3 flex items-center gap-3 px-4 py-2.5 bg-blue-50 border border-blue-200 rounded-lg">
           <Loader2 className="w-4 h-4 text-blue-600 animate-spin shrink-0" />
@@ -299,7 +453,119 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
         </div>
       )}
 
-      {/* Result */}
+      {/* Pipeline progress panel */}
+      {isPipelineProcessing && pipelineStatus && (
+        <div className="mx-5 mb-3 px-4 py-3 bg-indigo-50 border border-indigo-200 rounded-lg space-y-2.5">
+          {/* Current stage + spinner */}
+          <div className="flex items-center gap-3">
+            <Loader2 className="w-4 h-4 text-indigo-600 animate-spin shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-indigo-800">
+                {pipelineStatus.current_stage_label || 'Processing...'}
+              </p>
+            </div>
+            {pipelineStatus.elapsed_seconds != null && (
+              <div className="flex items-center gap-1 text-xs font-mono font-semibold text-indigo-700 bg-indigo-100 px-2 py-0.5 rounded shrink-0">
+                <Clock className="w-3 h-3" />
+                {pipelineStatus.elapsed_seconds.toFixed(1)}s
+              </div>
+            )}
+          </div>
+
+          {/* Per-doc progress bar for stages 1-3 */}
+          {showDocProgress && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs text-indigo-600">
+                <span>
+                  Documents: {pipelineStatus.processed_docs}/{pipelineStatus.total_docs}
+                </span>
+                <span className="font-mono">{pipelineDocProgress}%</span>
+              </div>
+              <div className="w-full bg-indigo-100 rounded-full h-1.5">
+                <div
+                  className="bg-indigo-500 h-1.5 rounded-full transition-all duration-300"
+                  style={{ width: `${pipelineDocProgress}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Completed stages as chips */}
+          {pipelineStatus.stages_completed.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {pipelineStatus.stages_completed.map((stage) => (
+                <span
+                  key={stage}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-emerald-700 bg-emerald-100 rounded-full"
+                >
+                  <CheckCircle className="w-3 h-3" />
+                  {stage}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Pipeline result banners */}
+      {isPipelineTerminal && pipelineStatus && (
+        <div
+          className={clsx(
+            'mx-5 mb-3 flex items-center gap-3 px-4 py-2.5 rounded-lg border',
+            pipelineStatus.state === 'done' && 'bg-emerald-50 border-emerald-200',
+            pipelineStatus.state === 'error' && 'bg-red-50 border-red-200',
+            pipelineStatus.state === 'cancelled' && 'bg-amber-50 border-amber-200'
+          )}
+        >
+          {pipelineStatus.state === 'done' && (
+            <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
+          )}
+          {pipelineStatus.state === 'error' && (
+            <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+          )}
+          {pipelineStatus.state === 'cancelled' && (
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+          )}
+          <div className="flex-1 min-w-0">
+            {pipelineStatus.state === 'done' && (
+              <p className="text-xs text-emerald-800">
+                <span className="font-semibold">Pipeline complete</span>
+                {' — '}
+                {pipelineStatus.stages_completed.length} stages finished
+                {pipelineStatus.org_name && (
+                  <span className="text-emerald-600 ml-1">
+                    for {pipelineStatus.org_name}
+                  </span>
+                )}
+              </p>
+            )}
+            {pipelineStatus.state === 'error' && (
+              <p className="text-xs text-red-700">
+                <span className="font-semibold">Pipeline failed</span>
+                {pipelineStatus.error && ` — ${pipelineStatus.error}`}
+              </p>
+            )}
+            {pipelineStatus.state === 'cancelled' && (
+              <p className="text-xs text-amber-700">
+                <span className="font-semibold">Pipeline cancelled</span>
+                {pipelineStatus.stages_completed.length > 0 && (
+                  <span className="text-amber-600 ml-1">
+                    after {pipelineStatus.stages_completed[pipelineStatus.stages_completed.length - 1]}
+                  </span>
+                )}
+              </p>
+            )}
+          </div>
+          {pipelineStatus.elapsed_seconds != null && (
+            <span className="flex items-center gap-1 text-xs font-mono text-slate-400 shrink-0">
+              <Clock className="w-3 h-3" />
+              {pipelineStatus.elapsed_seconds.toFixed(1)}s
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Upload result */}
       {result && !uploading && (
         <div
           className={clsx(
@@ -336,7 +602,7 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
       )}
 
       {/* Bottom padding when nothing below the drop zone */}
-      {files.length === 0 && !uploading && !result && <div className="h-2" />}
+      {files.length === 0 && !uploading && !result && !isPipelineProcessing && !isPipelineTerminal && <div className="h-2" />}
     </div>
   );
 }

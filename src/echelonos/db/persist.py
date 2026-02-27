@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from echelonos.db.models import Document, DocumentLink, Obligation, Organization
+from echelonos.db.models import Document, DocumentLink, Obligation, Organization, Page
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +46,43 @@ def get_or_create_organization(
     db.add(org)
     db.flush()
     return org
+
+
+# ---------------------------------------------------------------------------
+# pages
+# ---------------------------------------------------------------------------
+
+
+def upsert_page(
+    db: Session,
+    *,
+    doc_id: uuid.UUID,
+    page_number: int,
+    **fields: Any,
+) -> Page:
+    """Upsert a page keyed on *(doc_id, page_number)*."""
+    page = (
+        db.query(Page)
+        .filter(Page.doc_id == doc_id, Page.page_number == page_number)
+        .first()
+    )
+    if page is not None:
+        for key, value in fields.items():
+            if hasattr(page, key):
+                setattr(page, key, value)
+        return page
+
+    now = datetime.now(UTC)
+    page = Page(
+        id=uuid.uuid4(),
+        doc_id=doc_id,
+        page_number=page_number,
+        created_at=now,
+        **fields,
+    )
+    db.add(page)
+    db.flush()
+    return page
 
 
 # ---------------------------------------------------------------------------

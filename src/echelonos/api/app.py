@@ -14,10 +14,11 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 from typing import Any
 
-from fastapi import Depends, FastAPI, UploadFile, File
+from fastapi import Depends, FastAPI, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -223,23 +224,40 @@ def get_summary(org_name: str, db: Session = Depends(get_db)) -> dict:
 
 # Module-level pipeline status store (simple in-process tracking).
 _pipeline_status: dict[str, Any] = {
-    "state": "idle",  # idle | processing | done | error
+    "state": "idle",  # idle | processing | done | error | cancelled
     "org_name": None,
+    "org_id": None,
+    "current_stage": None,
+    "current_stage_label": None,
     "total_files": 0,
     "processed_files": 0,
+    "total_docs": 0,
+    "processed_docs": 0,
+    "stages_completed": [],
     "started_at": None,
     "finished_at": None,
     "elapsed_seconds": None,
     "error": None,
 }
 
+# Background pipeline thread state.
+_pipeline_thread: threading.Thread | None = None
+_cancel_event = threading.Event()
+_test_session_factory: Any = None  # Override in tests to inject DB session
+
 
 def _reset_pipeline_status() -> None:
     _pipeline_status.update(
         state="idle",
         org_name=None,
+        org_id=None,
+        current_stage=None,
+        current_stage_label=None,
         total_files=0,
         processed_files=0,
+        total_docs=0,
+        processed_docs=0,
+        stages_completed=[],
         started_at=None,
         finished_at=None,
         elapsed_seconds=None,
@@ -247,10 +265,28 @@ def _reset_pipeline_status() -> None:
     )
 
 
+def _set_stage(stage_id: str, label: str) -> None:
+    """Update status to reflect the current stage."""
+    _pipeline_status["current_stage"] = stage_id
+    _pipeline_status["current_stage_label"] = label
+
+
+def _complete_stage(label: str) -> None:
+    """Mark a stage as completed."""
+    _pipeline_status["stages_completed"] = [
+        *_pipeline_status["stages_completed"],
+        label,
+    ]
+
+
 @app.get("/api/pipeline/status")
 def pipeline_status() -> dict:
     """Return the current pipeline processing status."""
-    return dict(_pipeline_status)
+    result = dict(_pipeline_status)
+    # Compute live elapsed_seconds when processing.
+    if result["state"] == "processing" and result["started_at"] is not None:
+        result["elapsed_seconds"] = round(time.time() - result["started_at"], 2)
+    return result
 
 
 @app.post("/api/upload")
@@ -298,8 +334,8 @@ async def upload_documents(
             with zipfile.ZipFile(zip_path, "r") as zf:
                 zf.extractall(org_dir)
 
-            total_uploaded = len(
-                [n for n in os.listdir(org_dir) if os.path.isfile(os.path.join(org_dir, n))]
+            total_uploaded = sum(
+                1 for _, _, files in os.walk(org_dir) for _ in files
             )
 
         else:
@@ -450,3 +486,478 @@ def clear_database(db: Session = Depends(get_db)) -> dict:
     _reset_pipeline_status()
     logger.info("Database cleared: %s", counts)
     return {"status": "ok", "deleted": counts}
+
+
+# ---------------------------------------------------------------------------
+# Pipeline run / stop
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/pipeline/run")
+def run_pipeline(
+    org_name: str = Query(..., description="Organization name to process"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Launch stages 1-7 in a background thread for the given organization."""
+    global _pipeline_thread
+
+    # Guard: is a pipeline already running?
+    if (
+        _pipeline_thread is not None
+        and _pipeline_thread.is_alive()
+    ):
+        return {"status": "error", "error": "Pipeline is already running"}
+
+    # Validate org exists.
+    org = (
+        db.query(Organization)
+        .filter(func.lower(Organization.name) == org_name.lower())
+        .first()
+    )
+    if org is None:
+        return {"status": "error", "error": f"Organization '{org_name}' not found"}
+
+    # Validate org has documents.
+    doc_count = db.query(Document).filter(Document.org_id == org.id).count()
+    if doc_count == 0:
+        return {"status": "error", "error": f"No documents found for '{org_name}'"}
+
+    # Reset cancellation flag.
+    _cancel_event.clear()
+
+    # Initialize status.
+    _pipeline_status.update(
+        state="processing",
+        org_name=org_name,
+        org_id=str(org.id),
+        current_stage=None,
+        current_stage_label="Initializing...",
+        total_files=0,
+        processed_files=0,
+        total_docs=doc_count,
+        processed_docs=0,
+        stages_completed=[],
+        started_at=time.time(),
+        finished_at=None,
+        elapsed_seconds=None,
+        error=None,
+    )
+
+    # Launch background thread.
+    _pipeline_thread = threading.Thread(
+        target=_run_pipeline_background,
+        args=(org_name, str(org.id)),
+        daemon=True,
+    )
+    _pipeline_thread.start()
+
+    return {"status": "ok", "message": f"Pipeline started for '{org_name}'"}
+
+
+@app.post("/api/pipeline/stop")
+def stop_pipeline() -> dict:
+    """Request cancellation of the running pipeline."""
+    if (
+        _pipeline_thread is None
+        or not _pipeline_thread.is_alive()
+    ):
+        return {"status": "error", "error": "No pipeline is currently running"}
+
+    _cancel_event.set()
+    _pipeline_status.update(
+        state="cancelled",
+        current_stage_label="Cancelling...",
+    )
+    return {"status": "ok", "message": "Pipeline cancellation requested"}
+
+
+def _run_pipeline_background(org_name: str, org_id: str) -> None:
+    """Execute stages 1-7 in a background thread.
+
+    Creates its own DB session (thread-safe) and LLM clients.
+    Checks ``_cancel_event`` between stages and between documents.
+    """
+    import uuid as _uuid
+
+    from echelonos.db.persist import (
+        upsert_document,
+        upsert_document_link,
+        upsert_obligation,
+        upsert_page,
+    )
+
+    if _test_session_factory is not None:
+        db = _test_session_factory()
+    else:
+        from echelonos.db.session import SessionLocal
+        db = SessionLocal()
+
+    try:
+        # Load clients once.
+        from echelonos.llm.claude_client import get_anthropic_client
+        from echelonos.ocr.mistral_client import get_mistral_client
+
+        ocr_client = get_mistral_client()
+        claude_client = get_anthropic_client()
+
+        # Load documents for this org.
+        org_uuid = _uuid.UUID(org_id)
+        docs = db.query(Document).filter(Document.org_id == org_uuid).all()
+        total = len(docs)
+        _pipeline_status["total_docs"] = total
+        _pipeline_status["processed_docs"] = 0
+
+        # ---- Stage 1: OCR ----
+        if _cancel_event.is_set():
+            return
+        _set_stage("stage_1", "Stage 1: OCR — Extracting text")
+
+        from echelonos.stages.stage_1_ocr import ingest_document
+
+        for i, doc in enumerate(docs):
+            if _cancel_event.is_set():
+                return
+            try:
+                ocr_result = ingest_document(
+                    file_path=doc.file_path,
+                    doc_id=str(doc.id),
+                    ocr_client=ocr_client,
+                )
+                for page_data in ocr_result.get("pages", []):
+                    upsert_page(
+                        db,
+                        doc_id=doc.id,
+                        page_number=page_data["page_number"],
+                        text=page_data.get("text"),
+                        tables_markdown=page_data.get("tables_markdown"),
+                        ocr_confidence=page_data.get("ocr_confidence"),
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("OCR failed for doc %s", doc.id)
+            _pipeline_status["processed_docs"] = i + 1
+
+        _complete_stage("OCR")
+
+        # ---- Stage 2: Classification ----
+        if _cancel_event.is_set():
+            return
+        _set_stage("stage_2", "Stage 2: Classification")
+        _pipeline_status["processed_docs"] = 0
+
+        from echelonos.stages.stage_2_classification import (
+            classify_document,
+            classify_with_cross_check,
+        )
+
+        for i, doc in enumerate(docs):
+            if _cancel_event.is_set():
+                return
+            try:
+                # Gather text from pages.
+                pages = (
+                    db.query(Page)
+                    .filter(Page.doc_id == doc.id)
+                    .order_by(Page.page_number)
+                    .all()
+                )
+                full_text = "\n\n".join(p.text or "" for p in pages)
+                if not full_text.strip():
+                    _pipeline_status["processed_docs"] = i + 1
+                    continue
+
+                result = classify_document(full_text, claude_client=claude_client)
+                result = classify_with_cross_check(full_text, result)
+
+                # Update document fields.
+                doc.doc_type = result.doc_type
+                doc.parties = result.parties
+                doc.effective_date = result.effective_date
+                doc.parent_reference_raw = result.parent_reference_raw
+                doc.classification_confidence = result.confidence
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("Classification failed for doc %s", doc.id)
+            _pipeline_status["processed_docs"] = i + 1
+
+        _complete_stage("Classification")
+
+        # ---- Stage 3: Extraction ----
+        if _cancel_event.is_set():
+            return
+        _set_stage("stage_3", "Stage 3: Obligation Extraction")
+        _pipeline_status["processed_docs"] = 0
+
+        from echelonos.stages.stage_3_extraction import extract_and_verify
+
+        for i, doc in enumerate(docs):
+            if _cancel_event.is_set():
+                return
+            try:
+                pages = (
+                    db.query(Page)
+                    .filter(Page.doc_id == doc.id)
+                    .order_by(Page.page_number)
+                    .all()
+                )
+                full_text = "\n\n".join(p.text or "" for p in pages)
+                if not full_text.strip():
+                    _pipeline_status["processed_docs"] = i + 1
+                    continue
+
+                verified = extract_and_verify(full_text, claude_client=claude_client)
+                for item in verified:
+                    obl_data = item.get("obligation", {})
+                    upsert_obligation(
+                        db,
+                        doc_id=doc.id,
+                        source_clause=obl_data.get("source_clause", ""),
+                        obligation_text=obl_data.get("obligation_text", ""),
+                        obligation_type=obl_data.get("obligation_type"),
+                        responsible_party=obl_data.get("responsible_party"),
+                        counterparty=obl_data.get("counterparty"),
+                        frequency=obl_data.get("frequency"),
+                        deadline=obl_data.get("deadline"),
+                        source_page=obl_data.get("source_page"),
+                        confidence=item.get("claude_verification", {}).get(
+                            "confidence", obl_data.get("confidence")
+                        ),
+                        status=item.get("status", "ACTIVE"),
+                        verification_result=item.get("claude_verification"),
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("Extraction failed for doc %s", doc.id)
+            _pipeline_status["processed_docs"] = i + 1
+
+        _complete_stage("Extraction")
+
+        # ---- Stage 4: Linking ----
+        if _cancel_event.is_set():
+            return
+        _set_stage("stage_4", "Stage 4: Document Linking")
+
+        from echelonos.stages.stage_4_linking import link_documents
+
+        try:
+            doc_dicts = []
+            for doc in docs:
+                doc_dicts.append({
+                    "id": str(doc.id),
+                    "doc_type": doc.doc_type,
+                    "filename": doc.filename,
+                    "parties": doc.parties,
+                    "effective_date": str(doc.effective_date) if doc.effective_date else None,
+                    "parent_reference_raw": doc.parent_reference_raw,
+                })
+
+            link_results = link_documents(doc_dicts)
+            for lr in link_results:
+                child_id = _uuid.UUID(lr["child_doc_id"])
+                parent_id = (
+                    _uuid.UUID(lr["parent_doc_id"])
+                    if lr.get("parent_doc_id")
+                    else None
+                )
+                upsert_document_link(
+                    db,
+                    child_doc_id=child_id,
+                    parent_doc_id=parent_id,
+                    link_status=lr.get("status", "UNLINKED"),
+                    candidates=lr.get("candidates"),
+                )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Linking failed for org %s", org_name)
+
+        _complete_stage("Linking")
+
+        # ---- Stage 5: Amendment Resolution ----
+        if _cancel_event.is_set():
+            return
+        _set_stage("stage_5", "Stage 5: Amendment Resolution")
+
+        from echelonos.stages.stage_5_amendment import resolve_all
+
+        try:
+            # Re-read docs and links from DB for fresh state.
+            docs_refreshed = db.query(Document).filter(Document.org_id == org_uuid).all()
+            doc_dicts_for_amend = []
+            for doc in docs_refreshed:
+                obligations_orm = (
+                    db.query(Obligation).filter(Obligation.doc_id == doc.id).all()
+                )
+                doc_dicts_for_amend.append({
+                    "id": str(doc.id),
+                    "doc_type": doc.doc_type,
+                    "filename": doc.filename,
+                    "obligations": [
+                        {
+                            "id": str(o.id),
+                            "doc_id": str(o.doc_id),
+                            "obligation_text": o.obligation_text,
+                            "obligation_type": o.obligation_type,
+                            "source_clause": o.source_clause,
+                            "status": o.status,
+                        }
+                        for o in obligations_orm
+                    ],
+                })
+
+            links_orm = (
+                db.query(DocumentLink)
+                .filter(DocumentLink.child_doc_id.in_([d.id for d in docs_refreshed]))
+                .all()
+            )
+            link_dicts = [
+                {
+                    "child_doc_id": str(l.child_doc_id),
+                    "parent_doc_id": str(l.parent_doc_id) if l.parent_doc_id else None,
+                    "status": l.link_status,
+                }
+                for l in links_orm
+            ]
+
+            resolved = resolve_all(
+                doc_dicts_for_amend, link_dicts, claude_client=claude_client
+            )
+            for obl_dict in resolved:
+                obl_id = _uuid.UUID(obl_dict["id"])
+                obl = db.query(Obligation).filter(Obligation.id == obl_id).first()
+                if obl:
+                    obl.status = obl_dict.get("status", obl.status)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Amendment resolution failed for org %s", org_name)
+
+        _complete_stage("Amendment Resolution")
+
+        # ---- Stage 6: Evidence Packaging ----
+        if _cancel_event.is_set():
+            return
+        _set_stage("stage_6", "Stage 6: Evidence Packaging")
+
+        from echelonos.stages.stage_6_evidence import package_evidence
+
+        try:
+            docs_refreshed = db.query(Document).filter(Document.org_id == org_uuid).all()
+            doc_ids = [d.id for d in docs_refreshed]
+
+            all_obligations = (
+                db.query(Obligation).filter(Obligation.doc_id.in_(doc_ids)).all()
+            )
+
+            obl_dicts = [
+                {
+                    "id": str(o.id),
+                    "doc_id": str(o.doc_id),
+                    "obligation_text": o.obligation_text,
+                    "obligation_type": o.obligation_type,
+                    "source_clause": o.source_clause,
+                    "source_page": o.source_page,
+                    "status": o.status,
+                    "confidence": o.confidence,
+                    "verification_result": o.verification_result,
+                }
+                for o in all_obligations
+            ]
+
+            doc_map = {
+                str(d.id): {
+                    "id": str(d.id),
+                    "doc_type": d.doc_type,
+                    "filename": d.filename,
+                }
+                for d in docs_refreshed
+            }
+
+            verifications = {
+                str(o.id): o.verification_result or {}
+                for o in all_obligations
+            }
+
+            evidence_records = package_evidence(
+                obligations=obl_dicts,
+                documents=doc_map,
+                verifications=verifications,
+            )
+
+            for ev in evidence_records:
+                existing = (
+                    db.query(Evidence)
+                    .filter(
+                        Evidence.obligation_id == _uuid.UUID(ev.obligation_id),
+                        Evidence.doc_id == _uuid.UUID(ev.doc_id),
+                        Evidence.source_clause == ev.source_clause,
+                    )
+                    .first()
+                )
+                if existing is None:
+                    db.add(
+                        Evidence(
+                            id=_uuid.uuid4(),
+                            obligation_id=_uuid.UUID(ev.obligation_id),
+                            doc_id=_uuid.UUID(ev.doc_id),
+                            page_number=ev.page_number,
+                            source_clause=ev.source_clause,
+                            extraction_model=ev.extraction_model,
+                            verification_model=ev.verification_model,
+                            verification_result=ev.verification_result,
+                            confidence=ev.confidence,
+                            amendment_history=ev.amendment_history,
+                        )
+                    )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Evidence packaging failed for org %s", org_name)
+
+        _complete_stage("Evidence")
+
+        # ---- Stage 7: Report (no-op) ----
+        if _cancel_event.is_set():
+            return
+        _set_stage("stage_7", "Stage 7: Report Ready")
+        _complete_stage("Report")
+
+        # Done.
+        _pipeline_status.update(
+            state="done",
+            current_stage=None,
+            current_stage_label=None,
+            finished_at=time.time(),
+            elapsed_seconds=round(
+                time.time() - (_pipeline_status.get("started_at") or time.time()), 2
+            ),
+        )
+
+    except Exception as exc:
+        logger.exception("Pipeline background thread failed for %s", org_name)
+        _pipeline_status.update(
+            state="error",
+            finished_at=time.time(),
+            elapsed_seconds=round(
+                time.time() - (_pipeline_status.get("started_at") or time.time()), 2
+            ),
+            error=str(exc),
+        )
+    finally:
+        if _test_session_factory is None:
+            db.close()
+        if _cancel_event.is_set() and _pipeline_status["state"] != "error":
+            _pipeline_status.update(
+                state="cancelled",
+                current_stage=None,
+                current_stage_label=None,
+                finished_at=time.time(),
+                elapsed_seconds=round(
+                    time.time()
+                    - (_pipeline_status.get("started_at") or time.time()),
+                    2,
+                ),
+            )

@@ -39,3 +39,15 @@ export interface ObligationReport {
   flags: FlagItem[];
   summary: SummaryData;
 }
+
+export interface PipelineStatus {
+  state: 'idle' | 'processing' | 'done' | 'error' | 'cancelled';
+  org_name: string | null;
+  current_stage: string | null;
+  current_stage_label: string | null;
+  total_docs: number;
+  processed_docs: number;
+  stages_completed: string[];
+  elapsed_seconds: number | null;
+  error: string | null;
+}

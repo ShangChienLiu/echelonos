@@ -192,6 +192,7 @@ function App() {
         <DocumentUpload
           onUploadComplete={refreshAfterUpload}
           onClearDatabase={handleClearDatabase}
+          selectedOrg={selectedOrg}
         />
 
         {/* Loading */}
