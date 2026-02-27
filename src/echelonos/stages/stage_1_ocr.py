@@ -1,14 +1,13 @@
 """Stage 1: Document Ingestion / OCR.
 
-Uses Azure Document Intelligence to OCR PDF documents, extracting per-page
-text with page numbers and preserving table structures as markdown tables.
-Includes an OCR confidence quality gate that flags low-confidence pages.
+Uses Mistral OCR to process PDF documents, extracting per-page text with
+page numbers and preserving table structures as markdown tables.  Includes
+an OCR confidence quality gate that flags low-confidence pages.
 """
 
 from __future__ import annotations
 
 import structlog
-from azure.core.exceptions import HttpResponseError, ServiceRequestError
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -16,7 +15,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from echelonos.ocr.azure_client import analyze_document, get_azure_client
+from echelonos.ocr.mistral_client import analyze_document, get_mistral_client
 
 log = structlog.get_logger(__name__)
 
@@ -83,9 +82,9 @@ def _assess_confidence(pages: list[dict]) -> list[dict]:
 
 
 def _build_page_result(raw_page: dict) -> dict:
-    """Normalise a raw page dict from azure_client into the stage-1 schema.
+    """Normalise a raw page dict from mistral_client into the stage-1 schema.
 
-    The azure_client returns pages with keys ``page_number``, ``text``,
+    The mistral_client returns pages with keys ``page_number``, ``text``,
     ``tables`` (list of markdown strings), and ``confidence``.  We merge
     tables into a single ``tables_markdown`` string and rename
     ``confidence`` to ``ocr_confidence``.
@@ -100,13 +99,13 @@ def _build_page_result(raw_page: dict) -> dict:
 
 
 @retry(
-    retry=retry_if_exception_type((HttpResponseError, ServiceRequestError, ConnectionError, TimeoutError)),
+    retry=retry_if_exception_type((ConnectionError, TimeoutError)),
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=30),
     reraise=True,
 )
-def _call_azure(client, file_path: str) -> dict:
-    """Call Azure Document Intelligence with retry logic for transient errors."""
+def _call_mistral(client, file_path: str) -> dict:
+    """Call Mistral OCR with retry logic for transient errors."""
     return analyze_document(client, file_path)
 
 
@@ -118,9 +117,9 @@ def _call_azure(client, file_path: str) -> dict:
 def ingest_document(
     file_path: str,
     doc_id: str,
-    azure_client=None,
+    ocr_client=None,
 ) -> dict:
-    """Ingest a PDF document via Azure Document Intelligence OCR.
+    """Ingest a PDF document via Mistral OCR.
 
     Parameters
     ----------
@@ -128,9 +127,9 @@ def ingest_document(
         Path to the PDF file to ingest.
     doc_id:
         Unique identifier for the document in the pipeline.
-    azure_client:
-        Optional pre-configured ``DocumentIntelligenceClient``.  When
-        ``None`` a new client is created from application settings.
+    ocr_client:
+        Optional pre-configured ``Mistral`` client.  When ``None`` a new
+        client is created from application settings.
 
     Returns
     -------
@@ -143,33 +142,14 @@ def ingest_document(
     """
     log.info("ingesting_document", file_path=file_path, doc_id=doc_id)
 
-    if azure_client is None:
-        azure_client = get_azure_client()
+    if ocr_client is None:
+        ocr_client = get_mistral_client()
 
     try:
-        raw_result = _call_azure(azure_client, file_path)
-    except (HttpResponseError, ServiceRequestError) as exc:
-        log.error(
-            "azure_api_error",
-            file_path=file_path,
-            doc_id=doc_id,
-            error=str(exc),
-        )
-        return {
-            "doc_id": doc_id,
-            "pages": [],
-            "total_pages": 0,
-            "flags": [
-                {
-                    "page_number": 0,
-                    "flag_type": "OCR_ERROR",
-                    "message": f"Azure Document Intelligence API error: {exc}",
-                }
-            ],
-        }
+        raw_result = _call_mistral(ocr_client, file_path)
     except Exception as exc:
         log.error(
-            "ocr_unexpected_error",
+            "ocr_api_error",
             file_path=file_path,
             doc_id=doc_id,
             error=str(exc),
@@ -182,7 +162,7 @@ def ingest_document(
                 {
                     "page_number": 0,
                     "flag_type": "OCR_ERROR",
-                    "message": f"Unexpected OCR error: {exc}",
+                    "message": f"Mistral OCR API error: {exc}",
                 }
             ],
         }

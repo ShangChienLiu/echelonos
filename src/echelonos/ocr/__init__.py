@@ -1,1 +1,1 @@
-"""OCR integration for document processing."""
+"""OCR integration for document processing (Mistral OCR)."""

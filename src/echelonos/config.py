@@ -19,9 +19,9 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250514"
 
-    # Azure Document Intelligence (OCR)
-    azure_doc_intelligence_endpoint: str = ""
-    azure_doc_intelligence_key: str = ""
+    # Mistral (OCR)
+    mistral_api_key: str = ""
+    mistral_ocr_model: str = "mistral-ocr-latest"
 
     # Prefect
     prefect_api_url: str = "http://localhost:4200/api"
