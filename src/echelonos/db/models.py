@@ -33,6 +33,9 @@ class Base(DeclarativeBase):
 
 class Organization(Base):
     __tablename__ = "organizations"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_organizations_name"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -58,6 +61,7 @@ class Organization(Base):
 class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (
+        UniqueConstraint("org_id", "file_path", name="uq_documents_org_file_path"),
         Index("ix_documents_parties", "parties", postgresql_using="gin"),
         Index("ix_documents_effective_date", "effective_date"),
         Index("ix_documents_org_id", "org_id"),
@@ -126,6 +130,10 @@ class Document(Base):
 class DocumentLink(Base):
     __tablename__ = "document_links"
     __table_args__ = (
+        UniqueConstraint(
+            "child_doc_id", "parent_doc_id",
+            name="uq_document_links_child_parent",
+        ),
         Index("ix_document_links_child_doc_id", "child_doc_id"),
         Index("ix_document_links_parent_doc_id", "parent_doc_id"),
         Index("ix_document_links_link_status", "link_status"),
@@ -224,6 +232,10 @@ class Page(Base):
 class Obligation(Base):
     __tablename__ = "obligations"
     __table_args__ = (
+        UniqueConstraint(
+            "doc_id", "source_clause", "obligation_text",
+            name="uq_obligations_doc_clause_text",
+        ),
         Index("ix_obligations_doc_id", "doc_id"),
         Index("ix_obligations_status", "status"),
         Index("ix_obligations_obligation_type", "obligation_type"),
