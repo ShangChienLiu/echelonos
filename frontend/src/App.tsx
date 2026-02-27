@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Shield, RefreshCw, AlertCircle, BarChart3, Table2, Flag } from 'lucide-react';
+import { Shield, RefreshCw, AlertCircle, BarChart3, Table2, Flag, ChevronDown } from 'lucide-react';
 import clsx from 'clsx';
 import type { ObligationReport, ObligationRow } from './types';
 import { mockReport } from './mockData';
@@ -11,18 +11,43 @@ import SummaryCharts from './components/SummaryCharts';
 
 type Tab = 'obligations' | 'flags' | 'summary';
 
+interface OrgOption {
+  id: string;
+  name: string;
+}
+
 function App() {
   const [report, setReport] = useState<ObligationReport | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('obligations');
   const [selectedObligation, setSelectedObligation] = useState<ObligationRow | null>(null);
+  const [organizations, setOrganizations] = useState<OrgOption[]>([]);
+  const [selectedOrg, setSelectedOrg] = useState<string>('demo-org');
+
+  // Fetch available organizations on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/organizations');
+        if (res.ok) {
+          const orgs: OrgOption[] = await res.json();
+          setOrganizations(orgs);
+          if (orgs.length > 0) {
+            setSelectedOrg(orgs[0].name);
+          }
+        }
+      } catch {
+        // API not available — keep default
+      }
+    })();
+  }, []);
 
   const fetchReport = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/report/demo-org');
+      const res = await fetch(`/api/report/${encodeURIComponent(selectedOrg)}`);
       if (res.ok) {
         const data: ObligationReport = await res.json();
         setReport(data);
@@ -38,7 +63,7 @@ function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [selectedOrg]);
 
   useEffect(() => {
     fetchReport();
@@ -71,6 +96,24 @@ function App() {
             </div>
 
             <div className="flex items-center gap-4">
+              {/* Organization selector */}
+              {organizations.length > 0 && (
+                <div className="relative">
+                  <select
+                    value={selectedOrg}
+                    onChange={(e) => setSelectedOrg(e.target.value)}
+                    className="appearance-none bg-slate-800 text-slate-300 text-xs font-medium pl-3 pr-7 py-1.5 rounded-md border border-slate-600 hover:border-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer"
+                  >
+                    {organizations.map((org) => (
+                      <option key={org.id} value={org.name}>
+                        {org.name}
+                      </option>
+                    ))}
+                  </select>
+                  <ChevronDown className="w-3 h-3 text-slate-400 absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none" />
+                </div>
+              )}
+
               {report && (
                 <span className="text-xs text-slate-400 hidden sm:inline-block">
                   {report.org_name} &middot; Generated{' '}
