@@ -191,6 +191,7 @@ class Fingerprint(Base):
     simhash: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     minhash_signature: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     identity_tokens: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    blocking_keys: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     structural_fingerprint: Mapped[Optional[str]] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, nullable=False)
 

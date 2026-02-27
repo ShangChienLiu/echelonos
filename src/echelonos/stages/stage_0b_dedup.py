@@ -3,8 +3,9 @@
 Layer 1 - File Hash (SHA-256): Hash raw bytes to catch exact copies.
 Layer 2 - Content Hash: Extract text, normalize, hash to catch format variants.
 Layer 3 - MinHash + LSH: Jaccard similarity via MinHashLSH index for near-duplicates.
-Layer 4 - Identity Tokens + Structural Fingerprint: Protects amendments/SOWs and
+Layer 4 - Blocking Keys + Structural Fingerprint: Protects amendments/SOWs and
           template-based documents with different PO numbers/amounts/dates.
+          Uses Claude-extracted structured fields when available, with regex fallback.
 """
 
 from __future__ import annotations
@@ -15,8 +16,148 @@ import string
 
 import structlog
 from datasketch import MinHash, MinHashLSH
+from pydantic import BaseModel
+
+from echelonos.llm.claude_client import extract_with_structured_output
 
 logger = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Blocking Key Fields (Pydantic model for structured extraction)
+# ---------------------------------------------------------------------------
+
+
+class BlockingKeyFields(BaseModel):
+    document_title: str | None = None
+    vendor_name: str | None = None
+    client_name: str | None = None
+    invoice_number: str | None = None
+    po_number: str | None = None
+    total_amount: str | None = None  # Raw string "$3,800.00"
+    document_date: str | None = None  # ISO-8601 preferred
+    contract_reference: str | None = None
+
+
+BLOCKING_KEY_SYSTEM_PROMPT = """You are a document field extractor for legal contracts, purchase orders, and invoices.
+
+Given the first portion of a document's text, extract the following fields if present.
+Return null for any field not found. Be precise — extract exact values as they appear.
+
+Fields to extract:
+- document_title: The title or type of document (e.g., "Purchase Order", "Master Services Agreement")
+- vendor_name: The vendor, supplier, or service provider name
+- client_name: The client, buyer, or customer name
+- invoice_number: Any invoice number or ID
+- po_number: Any purchase order number
+- total_amount: The total dollar amount (keep original formatting, e.g., "$3,800.00")
+- document_date: The primary date (effective date, issue date, etc.) — prefer ISO-8601 format
+- contract_reference: Any contract or agreement reference number"""
+
+MAX_TEXT_FOR_BLOCKING = 4000  # Only send first 4K chars (identifying info is in headers)
+
+
+# ---------------------------------------------------------------------------
+# Normalization helpers
+# ---------------------------------------------------------------------------
+
+_VENDOR_SUFFIXES = re.compile(
+    r"\b(llc\.?|inc\.?|corp\.?|corporation|company|co\.?|ltd\.?|lp\.?|plc\.?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_vendor(name: str | None) -> str:
+    """Strip LLC/Inc/Corp suffixes, lowercase, collapse whitespace."""
+    if not name:
+        return ""
+    result = name.strip().lower()
+    result = _VENDOR_SUFFIXES.sub("", result).strip()
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
+
+
+def _normalize_amount(amount: str | None) -> str:
+    """'$3,800.00' → '3800' (round to int)."""
+    if not amount:
+        return ""
+    cleaned = amount.replace("$", "").replace(",", "").strip()
+    try:
+        return str(round(float(cleaned)))
+    except ValueError:
+        return cleaned
+
+
+def _normalize_date(date_str: str | None) -> str:
+    """Normalize to YYYY-MM-DD. Handles ISO-8601 and US MM/DD/YYYY."""
+    if not date_str:
+        return ""
+    date_str = date_str.strip()
+    # Already ISO-8601
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return date_str
+    # US format MM/DD/YYYY
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", date_str)
+    if m:
+        month, day, year = m.groups()
+        return f"{year}-{int(month):02d}-{int(day):02d}"
+    return date_str
+
+
+def _normalize_id(value: str | None) -> str:
+    """Strip whitespace, lowercase."""
+    if not value:
+        return ""
+    return value.strip().lower()
+
+
+def _blocking_keys_match(a: BlockingKeyFields, b: BlockingKeyFields) -> bool:
+    """Field-level comparison with priority rules.
+
+    1. PO/invoice numbers differ → protect (False)
+    2. PO/invoice numbers match → collapse (True)
+    3. Same vendor, different amount → protect
+    4. Same vendor, different date → protect
+    5. No distinguishing fields → collapse (True)
+    """
+    # Normalize fields for comparison
+    a_po = _normalize_id(a.po_number)
+    b_po = _normalize_id(b.po_number)
+    a_inv = _normalize_id(a.invoice_number)
+    b_inv = _normalize_id(b.invoice_number)
+
+    # Priority 1: PO numbers
+    if a_po and b_po:
+        if a_po != b_po:
+            return False  # Different PO → protect
+        return True  # Same PO → collapse
+
+    # Priority 1b: Invoice numbers
+    if a_inv and b_inv:
+        if a_inv != b_inv:
+            return False  # Different invoice → protect
+        return True  # Same invoice → collapse
+
+    # Priority 2: Vendor + amount
+    a_vendor = _normalize_vendor(a.vendor_name)
+    b_vendor = _normalize_vendor(b.vendor_name)
+    a_amount = _normalize_amount(a.total_amount)
+    b_amount = _normalize_amount(b.total_amount)
+
+    if a_vendor and b_vendor and a_vendor == b_vendor:
+        if a_amount and b_amount and a_amount != b_amount:
+            return False  # Same vendor, different amount → protect
+
+    # Priority 3: Vendor + date
+    a_date = _normalize_date(a.document_date)
+    b_date = _normalize_date(b.document_date)
+
+    if a_vendor and b_vendor and a_vendor == b_vendor:
+        if a_date and b_date and a_date != b_date:
+            return False  # Same vendor, different date → protect
+
+    # No distinguishing fields → collapse
+    return True
 
 # ---------------------------------------------------------------------------
 # Layer 1: File Hash (SHA-256 of raw bytes)
@@ -179,6 +320,81 @@ def compute_structural_fingerprint(
 
 
 # ---------------------------------------------------------------------------
+# Claude-based blocking key extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_blocking_keys(
+    text: str,
+    claude_client=None,
+) -> BlockingKeyFields | None:
+    """Extract blocking keys from document text using Claude.
+
+    Returns None if Claude is unavailable or extraction fails.
+    """
+    if claude_client is None:
+        return None
+
+    try:
+        truncated = text[:MAX_TEXT_FOR_BLOCKING]
+        result = extract_with_structured_output(
+            claude_client,
+            BLOCKING_KEY_SYSTEM_PROMPT,
+            truncated,
+            BlockingKeyFields,
+        )
+        return result
+    except Exception:
+        logger.warning("blocking_keys.claude_extraction_failed", exc_info=True)
+        return None
+
+
+def _regex_fallback_blocking_keys(text: str) -> BlockingKeyFields | None:
+    """Extract blocking keys using regex patterns when Claude is unavailable.
+
+    Uses existing regex patterns to populate BlockingKeyFields as best-effort.
+    """
+    if not text or len(text.strip()) < MIN_TEXT_LENGTH:
+        return None
+
+    numbers = _RE_LONG_NUMBERS.findall(text)
+    amounts = _RE_DOLLAR_AMOUNTS.findall(text)
+    dates = _RE_DATES.findall(text)
+
+    if not numbers and not amounts and not dates:
+        return None
+
+    return BlockingKeyFields(
+        po_number=numbers[0] if numbers else None,
+        total_amount=amounts[0] if amounts else None,
+        document_date=dates[0] if dates else None,
+    )
+
+
+def _get_or_extract_blocking_keys(
+    fp: str,
+    text_cache: dict[str, str],
+    keys_cache: dict[str, BlockingKeyFields | None],
+    client,
+) -> BlockingKeyFields | None:
+    """Lazy extraction with caching: Claude → regex fallback → None."""
+    if fp in keys_cache:
+        return keys_cache[fp]
+
+    text = text_cache.get(fp, "")
+
+    # Try Claude first
+    keys = extract_blocking_keys(text, claude_client=client)
+
+    # Fall back to regex
+    if keys is None:
+        keys = _regex_fallback_blocking_keys(text)
+
+    keys_cache[fp] = keys
+    return keys
+
+
+# ---------------------------------------------------------------------------
 # Main deduplication entry point
 # ---------------------------------------------------------------------------
 
@@ -190,6 +406,7 @@ def deduplicate_files(
     *,
     minhash_threshold: float = MINHASH_THRESHOLD,
     num_perm: int = MINHASH_NUM_PERM,
+    claude_client=None,
 ) -> list[dict]:
     """Run the 4-layer dedup pipeline over *files* and return unique entries.
 
@@ -202,6 +419,9 @@ def deduplicate_files(
         Minimum Jaccard similarity for Layer 3 near-duplicate detection.
     num_perm:
         Number of permutations for MinHash signatures.
+    claude_client:
+        Optional Anthropic client for Claude-based blocking key extraction.
+        If None, regex fallback is used.
 
     Returns
     -------
@@ -219,8 +439,11 @@ def deduplicate_files(
 
     # MinHash LSH index for O(1) near-duplicate lookups
     lsh = MinHashLSH(threshold=minhash_threshold, num_perm=num_perm)
-    # file_path -> (structural_fingerprint, identity_tokens)
-    kept_metadata: dict[str, tuple[str, str]] = {}
+
+    # Blocking key caches (lazy — only populated when candidates match)
+    kept_blocking_keys: dict[str, BlockingKeyFields | None] = {}
+    kept_structural_fps: dict[str, str] = {}
+    text_cache: dict[str, str] = {}
 
     unique: list[dict] = []
 
@@ -249,10 +472,17 @@ def deduplicate_files(
         structural_fp = compute_structural_fingerprint(doc_type, date, parties)
         entry["structural_fingerprint"] = structural_fp
 
+        # Cache text for lazy blocking key extraction
+        if has_text:
+            text_cache[fp] = text
+
         # --- Layer 1: exact file hash -----------------------------------
         if file_hash in seen_file_hashes:
             candidate = seen_file_hashes[file_hash]
-            if not _identity_match(structural_fp, id_tokens, candidate, kept_metadata):
+            if not _identity_match_blocking(
+                fp, candidate, structural_fp,
+                text_cache, kept_blocking_keys, kept_structural_fps, claude_client,
+            ):
                 log.info("dedup.layer4_protected", layer=1, candidate=candidate)
             else:
                 entry["is_duplicate"] = True
@@ -264,7 +494,10 @@ def deduplicate_files(
         # --- Layer 2: content hash --------------------------------------
         if has_text and content_hash in seen_content_hashes:
             candidate = seen_content_hashes[content_hash]
-            if not _identity_match(structural_fp, id_tokens, candidate, kept_metadata):
+            if not _identity_match_blocking(
+                fp, candidate, structural_fp,
+                text_cache, kept_blocking_keys, kept_structural_fps, claude_client,
+            ):
                 log.info("dedup.layer4_protected", layer=2, candidate=candidate)
             else:
                 entry["is_duplicate"] = True
@@ -275,7 +508,10 @@ def deduplicate_files(
 
         # --- Layer 3: MinHash + LSH (near-duplicate) --------------------
         minhash_match = (
-            _find_minhash_match(minhash, structural_fp, id_tokens, lsh, kept_metadata)
+            _find_minhash_match_blocking(
+                minhash, fp, structural_fp, lsh,
+                text_cache, kept_blocking_keys, kept_structural_fps, claude_client,
+            )
             if has_text
             else None
         )
@@ -291,7 +527,12 @@ def deduplicate_files(
         if has_text:
             seen_content_hashes[content_hash] = fp
             lsh.insert(fp, minhash)
-        kept_metadata[fp] = (structural_fp, id_tokens)
+        kept_structural_fps[fp] = structural_fp
+
+        # Store blocking keys on entry if they've been extracted
+        bk = kept_blocking_keys.get(fp)
+        entry["blocking_keys"] = bk.model_dump() if bk else None
+
         entry["is_duplicate"] = False
         unique.append(entry)
         log.info("dedup.unique", file_path=fp)
@@ -310,78 +551,64 @@ def deduplicate_files(
 # ---------------------------------------------------------------------------
 
 
-def _identity_match(
+def _identity_match_blocking(
+    current_fp: str,
+    candidate_fp: str,
     structural_fp: str,
-    id_tokens: str,
-    original_path: str,
-    kept_metadata: dict[str, tuple[str, str]],
+    text_cache: dict[str, str],
+    keys_cache: dict[str, BlockingKeyFields | None],
+    structural_fps: dict[str, str],
+    client,
 ) -> bool:
-    """Return True if the candidate document matches the identity of the
-    entry at *original_path* in *kept_metadata*.
+    """Return True if the current document matches the identity of *candidate_fp*.
 
-    Checks two layers of identity:
-    1. Structural fingerprint (doc_type + date + parties) — from metadata.
-    2. Identity tokens (PO numbers, amounts, dates) — from text extraction.
-
-    If structural metadata is available and differs, the documents are
-    different (return False).  Otherwise, if identity tokens are available
-    and differ, the documents are different (return False).  When neither
-    source provides distinguishing information, treat as matching (return
-    True) to allow dedup.
+    Uses structural fingerprint first, then blocking keys (Claude or regex).
     """
-    if original_path not in kept_metadata:
-        return True
-
-    kept_sfp, kept_tokens = kept_metadata[original_path]
+    kept_sfp = structural_fps.get(candidate_fp, "")
     empty_fp = compute_structural_fingerprint("", "", [])
 
-    # Check structural fingerprint first (strongest signal)
+    # Check structural fingerprint first (strongest signal — from metadata)
     if kept_sfp != empty_fp and structural_fp != empty_fp:
         return kept_sfp == structural_fp
 
-    # Fall back to identity tokens
-    if kept_tokens and id_tokens:
-        return kept_tokens == id_tokens
+    # Fall back to blocking keys (lazy extraction)
+    current_keys = _get_or_extract_blocking_keys(
+        current_fp, text_cache, keys_cache, client,
+    )
+    candidate_keys = _get_or_extract_blocking_keys(
+        candidate_fp, text_cache, keys_cache, client,
+    )
 
-    # No distinguishing metadata at all — treat as match
+    if current_keys is not None and candidate_keys is not None:
+        return _blocking_keys_match(current_keys, candidate_keys)
+
+    # No distinguishing information — treat as match
     return True
 
 
-def _find_minhash_match(
+def _find_minhash_match_blocking(
     minhash: MinHash,
+    current_fp: str,
     structural_fp: str,
-    id_tokens: str,
     lsh: MinHashLSH,
-    kept_metadata: dict[str, tuple[str, str]],
+    text_cache: dict[str, str],
+    keys_cache: dict[str, BlockingKeyFields | None],
+    structural_fps: dict[str, str],
+    client,
 ) -> str | None:
     """Query the LSH index for candidate near-duplicates, then post-filter
-    through identity checks.
+    through blocking key checks.
 
     Returns the file_path of the first matching candidate, or None.
     """
     candidates = lsh.query(minhash)
-    return _find_identity_match_in_candidates(
-        candidates, structural_fp, id_tokens, kept_metadata
-    )
-
-
-def _find_identity_match_in_candidates(
-    candidates: list[str],
-    structural_fp: str,
-    id_tokens: str,
-    kept_metadata: dict[str, tuple[str, str]],
-) -> str | None:
-    """Post-filter LSH candidates through identity checks.
-
-    Returns the first candidate whose identity matches, or None.
-    """
     empty_fp = compute_structural_fingerprint("", "", [])
 
     for candidate_path in candidates:
-        if candidate_path not in kept_metadata:
+        if candidate_path not in structural_fps:
             continue
 
-        kept_sfp, kept_tokens = kept_metadata[candidate_path]
+        kept_sfp = structural_fps[candidate_path]
 
         # Check structural fingerprint (strongest signal)
         if kept_sfp != empty_fp and structural_fp != empty_fp:
@@ -389,13 +616,20 @@ def _find_identity_match_in_candidates(
                 return candidate_path
             continue  # Different structural identity
 
-        # Fall back to identity tokens
-        if kept_tokens and id_tokens:
-            if kept_tokens == id_tokens:
-                return candidate_path
-            continue  # Different identity tokens
+        # Fall back to blocking keys
+        current_keys = _get_or_extract_blocking_keys(
+            current_fp, text_cache, keys_cache, client,
+        )
+        candidate_keys = _get_or_extract_blocking_keys(
+            candidate_path, text_cache, keys_cache, client,
+        )
 
-        # No distinguishing metadata — treat as match
+        if current_keys is not None and candidate_keys is not None:
+            if _blocking_keys_match(current_keys, candidate_keys):
+                return candidate_path
+            continue  # Different blocking keys
+
+        # No distinguishing information — treat as match
         return candidate_path
 
     return None

@@ -8,12 +8,20 @@ together, end-to-end.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 from datasketch import MinHash
 from docx import Document as DocxDocument
 
 from echelonos.stages.stage_0b_dedup import (
+    BlockingKeyFields,
+    _blocking_keys_match,
+    _normalize_amount,
+    _normalize_date,
+    _normalize_id,
+    _normalize_vendor,
+    _regex_fallback_blocking_keys,
     compute_content_hash,
     compute_file_hash,
     compute_minhash,
@@ -626,3 +634,336 @@ class TestIdentityTokensPreventMinhashFalsePositives:
         assert len(unique) == 1
         assert files[1]["is_duplicate"] is True
         assert files[1]["dedup_layer"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Blocking Key Field Comparison Tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlockingKeyFieldComparison:
+    """Tests for _blocking_keys_match field-level comparison logic."""
+
+    def test_different_po_numbers_protect(self):
+        """Different PO numbers should protect documents from collapse."""
+        a = BlockingKeyFields(
+            vendor_name="7th Street Solutions",
+            po_number="4501693981",
+            total_amount="$3,800.00",
+        )
+        b = BlockingKeyFields(
+            vendor_name="7th Street Solutions",
+            po_number="4501703538",
+            total_amount="$4,125.00",
+        )
+        assert _blocking_keys_match(a, b) is False
+
+    def test_same_po_numbers_collapse(self):
+        """Same PO numbers should allow collapse."""
+        a = BlockingKeyFields(
+            vendor_name="7th Street Solutions",
+            po_number="4501693981",
+            total_amount="$3,800.00",
+        )
+        b = BlockingKeyFields(
+            vendor_name="7th Street Solutions",
+            po_number="4501693981",
+            total_amount="$3,800.00",
+        )
+        assert _blocking_keys_match(a, b) is True
+
+    def test_different_invoice_numbers_protect(self):
+        """Different invoice numbers should protect documents."""
+        a = BlockingKeyFields(
+            vendor_name="Acme Corp",
+            invoice_number="INV-2024-001",
+        )
+        b = BlockingKeyFields(
+            vendor_name="Acme Corp",
+            invoice_number="INV-2024-002",
+        )
+        assert _blocking_keys_match(a, b) is False
+
+    def test_same_vendor_different_amount_protect(self):
+        """Same vendor with different amounts should protect."""
+        a = BlockingKeyFields(
+            vendor_name="7th Street Solutions",
+            total_amount="$3,800.00",
+        )
+        b = BlockingKeyFields(
+            vendor_name="7th Street Solutions",
+            total_amount="$4,125.00",
+        )
+        assert _blocking_keys_match(a, b) is False
+
+    def test_same_vendor_different_date_protect(self):
+        """Same vendor with different dates should protect."""
+        a = BlockingKeyFields(
+            vendor_name="7th Street Solutions",
+            document_date="2025-05-13",
+        )
+        b = BlockingKeyFields(
+            vendor_name="7th Street Solutions",
+            document_date="2025-06-02",
+        )
+        assert _blocking_keys_match(a, b) is False
+
+    def test_no_distinguishing_fields_collapse(self):
+        """No distinguishing fields should allow collapse."""
+        a = BlockingKeyFields()
+        b = BlockingKeyFields()
+        assert _blocking_keys_match(a, b) is True
+
+    def test_vendor_normalization_llc_variants(self):
+        """Vendor names with LLC vs LLC. should be treated as same."""
+        a = BlockingKeyFields(
+            vendor_name="7th Street Solutions LLC",
+            po_number="4501693981",
+        )
+        b = BlockingKeyFields(
+            vendor_name="7th Street Solutions LLC.",
+            po_number="4501693981",
+        )
+        assert _blocking_keys_match(a, b) is True
+
+    def test_same_invoice_number_collapse(self):
+        """Same invoice number should allow collapse."""
+        a = BlockingKeyFields(
+            vendor_name="Acme Corp",
+            invoice_number="INV-2024-001",
+            total_amount="$5,000.00",
+        )
+        b = BlockingKeyFields(
+            vendor_name="Acme Corp",
+            invoice_number="INV-2024-001",
+            total_amount="$5,000.00",
+        )
+        assert _blocking_keys_match(a, b) is True
+
+
+# ---------------------------------------------------------------------------
+# Normalization Function Tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizationFunctions:
+    """Tests for field normalization helpers."""
+
+    def test_normalize_vendor_strips_llc(self):
+        assert _normalize_vendor("7th Street Solutions LLC") == "7th street solutions"
+
+    def test_normalize_vendor_strips_inc(self):
+        assert _normalize_vendor("Acme Corporation Inc.") == "acme corporation"
+
+    def test_normalize_vendor_strips_corp(self):
+        assert _normalize_vendor("Delta Corp") == "delta"
+
+    def test_normalize_vendor_collapses_whitespace(self):
+        assert _normalize_vendor("  Acme   Corp  ") == "acme"
+
+    def test_normalize_vendor_none_returns_empty(self):
+        assert _normalize_vendor(None) == ""
+
+    def test_normalize_amount_strips_dollar_and_commas(self):
+        assert _normalize_amount("$3,800.00") == "3800"
+
+    def test_normalize_amount_rounds_to_int(self):
+        assert _normalize_amount("$4,125.50") == "4126"
+
+    def test_normalize_amount_none_returns_empty(self):
+        assert _normalize_amount(None) == ""
+
+    def test_normalize_amount_plain_number(self):
+        assert _normalize_amount("1500") == "1500"
+
+    def test_normalize_date_iso_format(self):
+        assert _normalize_date("2025-05-13") == "2025-05-13"
+
+    def test_normalize_date_us_format(self):
+        assert _normalize_date("05/13/2025") == "2025-05-13"
+
+    def test_normalize_date_none_returns_empty(self):
+        assert _normalize_date(None) == ""
+
+    def test_normalize_id_strips_and_lowercases(self):
+        assert _normalize_id("  INV-2024-001  ") == "inv-2024-001"
+
+    def test_normalize_id_none_returns_empty(self):
+        assert _normalize_id(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# Blocking Keys with Claude (mocked) Tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlockingKeysWithClaude:
+    """Tests using mocked Claude extraction for blocking keys."""
+
+    def test_different_po_numbers_both_survive_with_claude(self, tmp_path: Path):
+        """Mock Claude returning different PO numbers — both docs survive."""
+        boilerplate = (
+            "7th Street Solutions LLC Temporary Staffing Services "
+            "Terms and Conditions Net 30 Ship to 123 Main Street "
+            "Authorized by John Smith Department of Operations "
+            "General Manager Cadillac Products Automotive Company "
+            "This purchase order is subject to the terms and conditions "
+            "attached hereto and incorporated herein by reference "
+            "Please remit payment to the address listed above "
+            "All invoices must reference the purchase order number "
+            "Vendor agrees to comply with all applicable laws and regulations "
+            "governing the performance of services under this agreement"
+        )
+        po_a = f"Purchase Order 4501693981 Date 05/13/2025 Amount $3,800.00 {boilerplate}"
+        po_b = f"Purchase Order 4501703538 Date 06/02/2025 Amount $4,125.00 {boilerplate}"
+
+        pdf_a = _make_pdf(tmp_path / "po_a.pdf", po_a)
+        pdf_b = _make_pdf(tmp_path / "po_b.pdf", po_b)
+
+        keys_a = BlockingKeyFields(
+            vendor_name="7th Street Solutions LLC",
+            po_number="4501693981",
+            total_amount="$3,800.00",
+            document_date="2025-05-13",
+        )
+        keys_b = BlockingKeyFields(
+            vendor_name="7th Street Solutions LLC",
+            po_number="4501703538",
+            total_amount="$4,125.00",
+            document_date="2025-06-02",
+        )
+
+        call_count = 0
+        def mock_extract(client, system_prompt, user_prompt, response_format):
+            nonlocal call_count
+            call_count += 1
+            if "4501693981" in user_prompt:
+                return keys_a
+            return keys_b
+
+        mock_client = MagicMock()
+
+        with patch(
+            "echelonos.stages.stage_0b_dedup.extract_with_structured_output",
+            side_effect=mock_extract,
+        ):
+            files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+            unique = deduplicate_files(files, claude_client=mock_client)
+
+        assert len(unique) == 2
+
+    def test_same_blocking_keys_collapse_with_claude(self, tmp_path: Path):
+        """Mock Claude returning identical keys — second doc collapses."""
+        boilerplate = (
+            "7th Street Solutions LLC Temporary Staffing Services "
+            "Terms and Conditions Net 30 Ship to 123 Main Street "
+            "Authorized by John Smith Department of Operations "
+            "General Manager Cadillac Products Automotive Company "
+            "This purchase order is subject to the terms and conditions "
+            "attached hereto and incorporated herein by reference "
+            "Please remit payment to the address listed above "
+            "All invoices must reference the purchase order number "
+            "Vendor agrees to comply with all applicable laws and regulations "
+            "governing the performance of services under this agreement"
+        )
+        text_a = f"Purchase Order 4501693981 Date 05/13/2025 Amount $3,800.00 {boilerplate}"
+        # Word-order variant with same details
+        text_b = f"Date 05/13/2025 Purchase Order 4501693981 Amount $3,800.00 {boilerplate}"
+
+        pdf_a = _make_pdf(tmp_path / "original.pdf", text_a)
+        pdf_b = _make_pdf(tmp_path / "variant.pdf", text_b)
+
+        same_keys = BlockingKeyFields(
+            vendor_name="7th Street Solutions LLC",
+            po_number="4501693981",
+            total_amount="$3,800.00",
+            document_date="2025-05-13",
+        )
+
+        mock_client = MagicMock()
+
+        with patch(
+            "echelonos.stages.stage_0b_dedup.extract_with_structured_output",
+            return_value=same_keys,
+        ):
+            files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+            unique = deduplicate_files(files, claude_client=mock_client)
+
+        assert len(unique) == 1
+
+    def test_claude_failure_falls_back_to_regex(self, tmp_path: Path):
+        """When Claude extraction fails, regex fallback should work."""
+        boilerplate = (
+            "7th Street Solutions LLC Temporary Staffing Services "
+            "Terms and Conditions Net 30 Ship to 123 Main Street "
+            "Authorized by John Smith Department of Operations "
+            "General Manager Cadillac Products Automotive Company "
+            "This purchase order is subject to the terms and conditions "
+            "attached hereto and incorporated herein by reference "
+            "Please remit payment to the address listed above "
+            "All invoices must reference the purchase order number "
+            "Vendor agrees to comply with all applicable laws and regulations "
+            "governing the performance of services under this agreement"
+        )
+        po_a = f"Purchase Order 4501693981 Date 05/13/2025 Amount $3,800.00 {boilerplate}"
+        po_b = f"Purchase Order 4501703538 Date 06/02/2025 Amount $4,125.00 {boilerplate}"
+
+        pdf_a = _make_pdf(tmp_path / "po_a.pdf", po_a)
+        pdf_b = _make_pdf(tmp_path / "po_b.pdf", po_b)
+
+        mock_client = MagicMock()
+
+        with patch(
+            "echelonos.stages.stage_0b_dedup.extract_with_structured_output",
+            side_effect=Exception("API error"),
+        ):
+            files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+            unique = deduplicate_files(files, claude_client=mock_client)
+
+        # Regex fallback should still protect different POs
+        assert len(unique) == 2
+
+
+# ---------------------------------------------------------------------------
+# Blocking Keys Fallback Tests
+# ---------------------------------------------------------------------------
+
+
+class TestBlockingKeysFallback:
+    """Tests for graceful fallback when Claude is unavailable."""
+
+    def test_no_api_key_pipeline_completes(self, tmp_path: Path):
+        """Without Claude client, pipeline uses regex fallback and completes."""
+        boilerplate = (
+            "7th Street Solutions LLC Temporary Staffing Services "
+            "Terms and Conditions Net 30 Ship to 123 Main Street "
+            "Authorized by John Smith Department of Operations "
+            "General Manager Cadillac Products Automotive Company "
+            "This purchase order is subject to the terms and conditions "
+            "attached hereto and incorporated herein by reference "
+            "Please remit payment to the address listed above "
+            "All invoices must reference the purchase order number "
+            "Vendor agrees to comply with all applicable laws and regulations "
+            "governing the performance of services under this agreement"
+        )
+        po_a = f"Purchase Order 4501693981 Date 05/13/2025 Amount $3,800.00 {boilerplate}"
+        po_b = f"Purchase Order 4501703538 Date 06/02/2025 Amount $4,125.00 {boilerplate}"
+
+        pdf_a = _make_pdf(tmp_path / "po_a.pdf", po_a)
+        pdf_b = _make_pdf(tmp_path / "po_b.pdf", po_b)
+
+        # No claude_client — should use regex fallback
+        files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+        unique = deduplicate_files(files)
+
+        # Both should survive via regex fallback protecting different POs
+        assert len(unique) == 2
+
+    def test_regex_fallback_extracts_blocking_keys(self):
+        """Regex fallback should extract PO numbers, amounts, and dates."""
+        text = "Purchase Order 4501693981 Date 05/13/2025 Amount $3,800.00"
+        keys = _regex_fallback_blocking_keys(text)
+        assert keys is not None
+        assert keys.po_number is not None
+        assert keys.total_amount is not None
+        assert keys.document_date is not None
