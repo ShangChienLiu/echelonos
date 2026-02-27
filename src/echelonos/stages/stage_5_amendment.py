@@ -321,6 +321,9 @@ def resolve_obligation(
             "action": resolution.action,
             "reasoning": resolution.reasoning,
             "confidence": resolution.confidence,
+            "doc_id": amend_obl.get("_source_doc_id"),
+            "doc_filename": amend_obl.get("_source_doc_filename"),
+            "amendment_number": amend_obl.get("_amendment_number"),
         }
         history.append(record)
 
@@ -407,10 +410,18 @@ def resolve_amendment_chain(
     msa_doc = chain_docs[0]
     msa_obligations = msa_doc.get("obligations", [])
 
-    # Collect all amendment obligations in chronological order.
+    # Collect all amendment obligations in chronological order,
+    # tagging each with document metadata for history tracking.
     amendment_obligations: list[dict] = []
-    for amend_doc in chain_docs[1:]:
-        amendment_obligations.extend(amend_doc.get("obligations", []))
+    for amend_idx, amend_doc in enumerate(chain_docs[1:], start=1):
+        doc_id = amend_doc.get("doc_id") or amend_doc.get("id")
+        doc_filename = amend_doc.get("filename")
+        for obl in amend_doc.get("obligations", []):
+            tagged = dict(obl)
+            tagged["_source_doc_id"] = doc_id
+            tagged["_source_doc_filename"] = doc_filename
+            tagged["_amendment_number"] = amend_idx
+            amendment_obligations.append(tagged)
 
     # Resolve each MSA obligation against the full amendment chain.
     resolved: list[dict] = []

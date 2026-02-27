@@ -1,3 +1,14 @@
+export interface AmendmentHistoryEntry {
+  amendment_obligation_text: string;
+  amendment_source_clause: string;
+  action: 'REPLACE' | 'MODIFY' | 'DELETE' | 'UNCHANGED';
+  reasoning: string;
+  confidence: number;
+  doc_id?: string;
+  doc_filename?: string;
+  amendment_number?: number;
+}
+
 export interface ObligationRow {
   number: number;
   obligation_text: string;
@@ -12,6 +23,7 @@ export interface ObligationRow {
   source_clause?: string;
   source_page?: number;
   doc_filename?: string;
+  amendment_history?: AmendmentHistoryEntry[];
 }
 
 export interface FlagItem {

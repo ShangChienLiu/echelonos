@@ -25,7 +25,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from echelonos.config import settings
-from echelonos.db.models import Base, Document, DocumentLink, Obligation, Organization
+from echelonos.db.models import Base, Document, DocumentLink, Evidence, Obligation, Organization
 from echelonos.api.app import app, get_db
 
 # ---------------------------------------------------------------------------
@@ -304,3 +304,73 @@ class TestHealthCheck:
         resp = client.get("/api/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Tests — amendment_history in report response
+# ---------------------------------------------------------------------------
+
+
+class TestAmendmentHistoryInReport:
+    """When Evidence table has amendment_history, the report should include it."""
+
+    def test_report_includes_amendment_history_from_evidence(
+        self, seeded_db: Session
+    ):
+        """Create an Evidence row with amendment_history and verify it
+        appears in the /api/report/{org} response."""
+        now = datetime.now(timezone.utc)
+
+        # Find the first obligation in the seeded data.
+        obl = seeded_db.query(Obligation).first()
+        doc = seeded_db.query(Document).filter(Document.id == obl.doc_id).first()
+
+        amendment_history = [
+            {
+                "amendment_obligation_text": "New delivery terms",
+                "amendment_source_clause": "Section 1.1 amended",
+                "action": "REPLACE",
+                "reasoning": "Delivery timeline changed from 30 to 15 days.",
+                "confidence": 0.95,
+                "doc_id": str(doc.id),
+                "doc_filename": "Amendment_1.pdf",
+                "amendment_number": 1,
+            }
+        ]
+
+        evidence = Evidence(
+            id=uuid.uuid4(),
+            obligation_id=obl.id,
+            doc_id=doc.id,
+            source_clause=obl.source_clause,
+            extraction_model="claude-sonnet-4-20250514",
+            verification_model="claude-sonnet-4-20250514",
+            verification_result="CONFIRMED",
+            confidence=0.95,
+            amendment_history=amendment_history,
+            created_at=now,
+        )
+        seeded_db.add(evidence)
+        seeded_db.flush()
+
+        def _override_get_db():
+            yield seeded_db
+
+        app.dependency_overrides[get_db] = _override_get_db
+        client = TestClient(app)
+        try:
+            resp = client.get("/api/report/Test Corp")
+            assert resp.status_code == 200
+            data = resp.json()
+
+            # Find the obligation that has amendment_history.
+            obligations_with_history = [
+                o for o in data["obligations"]
+                if o.get("amendment_history")
+            ]
+            assert len(obligations_with_history) >= 1
+            entry = obligations_with_history[0]["amendment_history"][0]
+            assert entry["action"] == "REPLACE"
+            assert entry["doc_filename"] == "Amendment_1.pdf"
+        finally:
+            app.dependency_overrides.clear()

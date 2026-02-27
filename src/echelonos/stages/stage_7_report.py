@@ -67,6 +67,7 @@ class ObligationRow(BaseModel):
     frequency: str | None = None
     deadline: str | None = None
     confidence: float
+    amendment_history: list[dict] | None = None
 
 
 class FlagItem(BaseModel):
@@ -237,6 +238,7 @@ def build_obligation_matrix(
             frequency=obl.get("frequency"),
             deadline=obl.get("deadline"),
             confidence=obl.get("confidence", 0.0),
+            amendment_history=obl.get("amendment_history"),
         )
         rows.append(row)
 

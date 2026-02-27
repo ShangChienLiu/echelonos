@@ -941,3 +941,119 @@ class TestResolveAllIntegration:
         """Empty documents and links produce empty result."""
         result = resolve_all([], [])
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: amendment_history includes document metadata
+# ---------------------------------------------------------------------------
+
+
+class TestAmendmentHistoryDocMetadata:
+    """resolve_obligation() output includes doc_id/doc_filename/amendment_number
+    in each history entry when amendment obligations carry those tags."""
+
+    def test_history_entries_include_doc_metadata(self):
+        """When amendment obligations are tagged with _source_doc_id,
+        _source_doc_filename, _amendment_number, the history records
+        should include doc_id, doc_filename, amendment_number."""
+        response = _make_comparison_response(
+            action="REPLACE",
+            reasoning="Delivery timeline changed from 30 to 15 days.",
+            confidence=0.95,
+        )
+
+        # Tag the amendment obligation with document metadata
+        # (as resolve_amendment_chain should do).
+        tagged_amendment = dict(AMENDMENT_1_DELIVERY)
+        tagged_amendment["_source_doc_id"] = "amend-001"
+        tagged_amendment["_source_doc_filename"] = "Amendment_1.pdf"
+        tagged_amendment["_amendment_number"] = 1
+
+        with _patch_structured(response):
+            result = resolve_obligation(
+                obligation=MSA_OBLIGATION_DELIVERY,
+                amendment_obligations=[tagged_amendment],
+                claude_client=MagicMock(),
+            )
+
+        assert result["status"] == "SUPERSEDED"
+        assert len(result["amendment_history"]) == 1
+        entry = result["amendment_history"][0]
+        assert entry["doc_id"] == "amend-001"
+        assert entry["doc_filename"] == "Amendment_1.pdf"
+        assert entry["amendment_number"] == 1
+
+    def test_history_entries_without_metadata_still_work(self):
+        """Backward compat: amendment obligations without metadata tags
+        produce history entries without doc_id/doc_filename/amendment_number."""
+        response = _make_comparison_response(
+            action="MODIFY",
+            reasoning="Payment terms changed.",
+            confidence=0.90,
+        )
+
+        with _patch_structured(response):
+            result = resolve_obligation(
+                obligation=MSA_OBLIGATION_PAYMENT,
+                amendment_obligations=[AMENDMENT_1_PAYMENT],
+                claude_client=MagicMock(),
+            )
+
+        assert result["status"] == "ACTIVE"
+        assert len(result["amendment_history"]) == 1
+        entry = result["amendment_history"][0]
+        # These keys should be absent or None when not tagged.
+        assert entry.get("doc_id") is None
+        assert entry.get("doc_filename") is None
+        assert entry.get("amendment_number") is None
+
+    def test_resolve_amendment_chain_tags_obligations(self):
+        """resolve_amendment_chain() should tag amendment obligations with
+        document metadata so that history entries contain it."""
+        responses = [
+            _make_comparison_response(
+                action="REPLACE",
+                reasoning="Delivery timeline changed.",
+                confidence=0.95,
+            ),
+        ]
+        # Buffer for extra comparisons.
+        for _ in range(10):
+            responses.append(
+                _make_comparison_response(
+                    action="UNCHANGED",
+                    reasoning="Different subject matter.",
+                    confidence=0.99,
+                )
+            )
+
+        chain_docs = [
+            {
+                "doc_id": "msa-001",
+                "doc_type": "MSA",
+                "filename": "MSA_2024.pdf",
+                "obligations": [MSA_OBLIGATION_DELIVERY],
+            },
+            {
+                "doc_id": "amend-001",
+                "doc_type": "Amendment",
+                "filename": "Amendment_1.pdf",
+                "obligations": [AMENDMENT_1_DELIVERY],
+            },
+        ]
+
+        with _patch_structured_side_effect(responses):
+            resolved = resolve_amendment_chain(chain_docs, claude_client=MagicMock())
+
+        # Find the superseded MSA obligation.
+        msa_resolved = [r for r in resolved if r.get("source_doc_id") == "msa-001"]
+        delivery = next(
+            r for r in msa_resolved
+            if "30 calendar days" in r.get("obligation_text", "")
+        )
+        assert delivery["status"] == "SUPERSEDED"
+        assert len(delivery["amendment_history"]) >= 1
+        entry = delivery["amendment_history"][0]
+        assert entry.get("doc_id") == "amend-001"
+        assert entry.get("doc_filename") == "Amendment_1.pdf"
+        assert entry.get("amendment_number") == 1

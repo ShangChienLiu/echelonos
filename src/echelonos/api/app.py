@@ -151,6 +151,26 @@ def _get_real_report(org_name: str, db: Session) -> ObligationReport | None:
             "confidence": (link.candidates or {}).get("confidence", 0.0),
         })
 
+    # Query Evidence table for amendment_history and merge into obligations.
+    evidence_rows = (
+        db.query(Evidence)
+        .filter(
+            Evidence.obligation_id.in_([o.id for o in obligations_orm]),
+            Evidence.amendment_history.isnot(None),
+        )
+        .all()
+    )
+    amendment_history_lookup: dict[str, list[dict]] = {}
+    for ev in evidence_rows:
+        obl_id_str = str(ev.obligation_id)
+        if ev.amendment_history and obl_id_str not in amendment_history_lookup:
+            amendment_history_lookup[obl_id_str] = ev.amendment_history
+
+    for obl_dict in obligations:
+        history = amendment_history_lookup.get(obl_dict["id"])
+        if history:
+            obl_dict["amendment_history"] = history
+
     return generate_report(
         org_name=org_name,
         obligations=obligations,
@@ -723,6 +743,7 @@ def _run_pipeline_background(org_name: str, org_id: str) -> None:
         session_factory = SessionLocal
 
     db = session_factory()
+    amendment_chains_lookup: dict[str, list[dict]] = {}
 
     try:
         # Load clients once.
@@ -879,6 +900,10 @@ def _run_pipeline_background(org_name: str, org_id: str) -> None:
                 obl = db.query(Obligation).filter(Obligation.id == obl_id).first()
                 if obl:
                     obl.status = obl_dict.get("status", obl.status)
+                # Build amendment_chains_lookup for Stage 6.
+                history = obl_dict.get("amendment_history")
+                if history:
+                    amendment_chains_lookup[obl_dict["id"]] = history
             db.commit()
         except Exception:
             db.rollback()
@@ -904,6 +929,7 @@ def _run_pipeline_background(org_name: str, org_id: str) -> None:
             obl_dicts = [
                 {
                     "id": str(o.id),
+                    "obligation_id": str(o.id),
                     "doc_id": str(o.doc_id),
                     "obligation_text": o.obligation_text,
                     "obligation_type": o.obligation_type,
@@ -911,6 +937,7 @@ def _run_pipeline_background(org_name: str, org_id: str) -> None:
                     "source_page": o.source_page,
                     "status": o.status,
                     "confidence": o.confidence,
+                    "extraction_model": o.extraction_model or "claude-sonnet-4-20250514",
                     "verification_result": o.verification_result,
                 }
                 for o in all_obligations
@@ -934,6 +961,7 @@ def _run_pipeline_background(org_name: str, org_id: str) -> None:
                 obligations=obl_dicts,
                 documents=doc_map,
                 verifications=verifications,
+                amendment_chains=amendment_chains_lookup,
             )
 
             for ev in evidence_records:

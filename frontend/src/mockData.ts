@@ -262,6 +262,18 @@ export const mockReport: ObligationReport = {
       source_clause: 'Section 1.1: The payment terms set forth in Section 7.1 of the MSA are hereby amended from Net 45 to Net 30.',
       source_page: 1,
       doc_filename: 'Amendment-2024-001.pdf',
+      amendment_history: [
+        {
+          amendment_obligation_text: 'Client shall pay all undisputed invoices within 30 days of receipt.',
+          amendment_source_clause: 'Section 1.1: The payment terms set forth in Section 7.1 of the MSA are hereby amended from Net 45 to Net 30.',
+          action: 'REPLACE',
+          reasoning: 'The amendment entirely replaces the payment term from Net 45 to Net 30, superseding the original clause.',
+          confidence: 0.92,
+          doc_id: 'doc-amendment-001',
+          doc_filename: 'Amendment-2024-001.pdf',
+          amendment_number: 1,
+        },
+      ],
     },
     {
       number: 18,
@@ -277,6 +289,18 @@ export const mockReport: ObligationReport = {
       source_clause: 'Section 2.1: The uptime guarantee in SOW Section 3.1 is hereby increased from 99.5% to 99.9% effective immediately.',
       source_page: 1,
       doc_filename: 'Amendment-2024-002.pdf',
+      amendment_history: [
+        {
+          amendment_obligation_text: 'Vendor shall maintain 99.9% uptime SLA for all production systems.',
+          amendment_source_clause: 'Section 2.1: The uptime guarantee in SOW Section 3.1 is hereby increased from 99.5% to 99.9% effective immediately.',
+          action: 'REPLACE',
+          reasoning: 'The amendment increases the uptime SLA from 99.5% to 99.9%, completely replacing the original requirement.',
+          confidence: 0.91,
+          doc_id: 'doc-amendment-002',
+          doc_filename: 'Amendment-2024-002.pdf',
+          amendment_number: 2,
+        },
+      ],
     },
     {
       number: 19,
@@ -292,6 +316,18 @@ export const mockReport: ObligationReport = {
       source_clause: 'Section 2.3: The critical incident response time is amended from four (4) hours to one (1) hour.',
       source_page: 2,
       doc_filename: 'Amendment-2024-002.pdf',
+      amendment_history: [
+        {
+          amendment_obligation_text: 'Vendor shall respond to critical incidents within 1 hour.',
+          amendment_source_clause: 'Section 2.3: The critical incident response time is amended from four (4) hours to one (1) hour.',
+          action: 'MODIFY',
+          reasoning: 'The amendment modifies the incident response time from 4 hours to 1 hour, tightening the SLA requirement.',
+          confidence: 0.89,
+          doc_id: 'doc-amendment-002',
+          doc_filename: 'Amendment-2024-002.pdf',
+          amendment_number: 2,
+        },
+      ],
     },
     {
       number: 20,
@@ -307,6 +343,18 @@ export const mockReport: ObligationReport = {
       source_clause: 'Section 3.1: Training capacity is expanded from twenty-five (25) users to fifty (50) users at no additional charge.',
       source_page: 2,
       doc_filename: 'Addendum-2024-001.pdf',
+      amendment_history: [
+        {
+          amendment_obligation_text: 'Vendor shall provide training for up to 50 users at no additional cost.',
+          amendment_source_clause: 'Section 3.1: Training capacity is expanded from twenty-five (25) users to fifty (50) users at no additional charge.',
+          action: 'REPLACE',
+          reasoning: 'The addendum replaces the original 25-user training obligation with a 50-user requirement.',
+          confidence: 0.86,
+          doc_id: 'doc-addendum-001',
+          doc_filename: 'Addendum-2024-001.pdf',
+          amendment_number: 1,
+        },
+      ],
     },
     {
       number: 21,
@@ -322,6 +370,18 @@ export const mockReport: ObligationReport = {
       source_clause: 'Section 2.5: Backup retention is extended from fourteen (14) days to thirty (30) days.',
       source_page: 3,
       doc_filename: 'Amendment-2024-002.pdf',
+      amendment_history: [
+        {
+          amendment_obligation_text: 'Vendor shall back up all client data daily with 30-day retention.',
+          amendment_source_clause: 'Section 2.5: Backup retention is extended from fourteen (14) days to thirty (30) days.',
+          action: 'MODIFY',
+          reasoning: 'The amendment modifies the backup retention period from 14 days to 30 days while keeping the daily backup frequency unchanged.',
+          confidence: 0.88,
+          doc_id: 'doc-amendment-002',
+          doc_filename: 'Amendment-2024-002.pdf',
+          amendment_number: 2,
+        },
+      ],
     },
     {
       number: 22,

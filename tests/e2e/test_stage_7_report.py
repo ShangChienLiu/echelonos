@@ -786,3 +786,111 @@ class TestEmptyObligations:
         assert report.summary["by_responsible_party"] == {}
         assert report.summary["flags_by_severity"] == {}
         assert report.summary["flags_by_type"] == {}
+
+
+# ---------------------------------------------------------------------------
+# test_obligation_row_amendment_history
+# ---------------------------------------------------------------------------
+
+
+class TestObligationRowAmendmentHistory:
+    """ObligationRow carries amendment_history when present."""
+
+    def test_obligation_row_with_amendment_history(self):
+        """ObligationRow can be created with amendment_history field."""
+        row = ObligationRow(
+            number=1,
+            obligation_text="Original delivery obligation",
+            obligation_type="Delivery",
+            responsible_party="Vendor",
+            counterparty="Client",
+            source="MSA §4.2 (Amd #1 modified)",
+            status="SUPERSEDED",
+            confidence=0.92,
+            amendment_history=[
+                {
+                    "amendment_obligation_text": "New delivery terms",
+                    "amendment_source_clause": "Section 1.1 amended",
+                    "action": "REPLACE",
+                    "reasoning": "Delivery timeline changed.",
+                    "confidence": 0.95,
+                    "doc_id": "amend-001",
+                    "doc_filename": "Amendment_1.pdf",
+                    "amendment_number": 1,
+                }
+            ],
+        )
+        assert row.amendment_history is not None
+        assert len(row.amendment_history) == 1
+        assert row.amendment_history[0]["action"] == "REPLACE"
+        assert row.amendment_history[0]["doc_id"] == "amend-001"
+
+    def test_obligation_row_without_amendment_history(self):
+        """ObligationRow defaults amendment_history to None."""
+        row = ObligationRow(
+            number=1,
+            obligation_text="Active obligation",
+            obligation_type="Delivery",
+            responsible_party="Vendor",
+            counterparty="Client",
+            source="MSA §4.2",
+            status="ACTIVE",
+            confidence=0.95,
+        )
+        assert row.amendment_history is None
+
+    def test_build_obligation_matrix_passes_amendment_history(self):
+        """build_obligation_matrix passes through amendment_history."""
+        obligations = [
+            _obligation(
+                obl_id="obl-hist",
+                status="SUPERSEDED",
+                obligation_text="Old delivery terms",
+            ),
+        ]
+        obligations[0]["amendment_history"] = [
+            {
+                "amendment_obligation_text": "New terms",
+                "action": "REPLACE",
+                "reasoning": "Changed.",
+                "confidence": 0.95,
+            }
+        ]
+        documents = {"doc-001": _document()}
+        links: list[dict] = []
+
+        rows = build_obligation_matrix(obligations, documents, links)
+
+        assert len(rows) == 1
+        assert rows[0].amendment_history is not None
+        assert len(rows[0].amendment_history) == 1
+        assert rows[0].amendment_history[0]["action"] == "REPLACE"
+
+    def test_json_includes_amendment_history(self):
+        """JSON export includes amendment_history when present."""
+        obligations = [
+            _obligation(obl_id="obl-json-hist", status="SUPERSEDED"),
+        ]
+        obligations[0]["amendment_history"] = [
+            {
+                "amendment_obligation_text": "New terms",
+                "action": "REPLACE",
+                "reasoning": "Changed.",
+                "confidence": 0.95,
+                "doc_id": "amend-001",
+                "doc_filename": "Amendment_1.pdf",
+                "amendment_number": 1,
+            }
+        ]
+        documents = {"doc-001": _document()}
+        links: list[dict] = []
+        report = generate_report(_ORG_NAME, obligations, documents, links)
+
+        json_str = export_to_json(report)
+        parsed = json.loads(json_str)
+
+        obl = parsed["obligations"][0]
+        assert "amendment_history" in obl
+        assert obl["amendment_history"] is not None
+        assert len(obl["amendment_history"]) == 1
+        assert obl["amendment_history"][0]["action"] == "REPLACE"

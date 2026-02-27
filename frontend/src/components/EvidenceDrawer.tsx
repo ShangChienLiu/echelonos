@@ -1,6 +1,6 @@
-import { X, FileText, Users, Scale, Clock, MapPin } from 'lucide-react';
+import { X, FileText, Users, Scale, Clock, MapPin, GitBranch } from 'lucide-react';
 import clsx from 'clsx';
-import type { ObligationRow } from '../types';
+import type { ObligationRow, AmendmentHistoryEntry } from '../types';
 
 interface EvidenceDrawerProps {
   obligation: ObligationRow | null;
@@ -119,6 +119,23 @@ export default function EvidenceDrawer({ obligation, onClose }: EvidenceDrawerPr
             </div>
           )}
 
+          {/* Amendment History */}
+          {obligation.amendment_history && obligation.amendment_history.length > 0 && (
+            <div>
+              <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-2">
+                <span className="flex items-center gap-1.5">
+                  <GitBranch className="w-4 h-4" />
+                  Amendment History
+                </span>
+              </h3>
+              <div className="space-y-3">
+                {obligation.amendment_history.map((entry, idx) => (
+                  <AmendmentHistoryCard key={idx} entry={entry} />
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Details grid */}
           <div>
             <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">
@@ -183,6 +200,55 @@ function DetailCard({
         <span className="text-xs font-medium text-slate-500">{label}</span>
       </div>
       <p className="text-sm font-medium text-slate-800 break-words">{value}</p>
+    </div>
+  );
+}
+
+const ACTION_BADGE_COLORS: Record<string, string> = {
+  REPLACE: 'bg-red-100 text-red-800',
+  MODIFY: 'bg-amber-100 text-amber-800',
+  DELETE: 'bg-slate-800 text-white',
+  UNCHANGED: 'bg-slate-100 text-slate-600',
+};
+
+function AmendmentHistoryCard({ entry }: { entry: AmendmentHistoryEntry }) {
+  return (
+    <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+      <div className="flex items-center justify-between mb-2">
+        <span
+          className={clsx(
+            'text-xs font-bold px-2.5 py-0.5 rounded-full',
+            ACTION_BADGE_COLORS[entry.action] ?? 'bg-slate-100 text-slate-600'
+          )}
+        >
+          {entry.action}
+        </span>
+        {entry.doc_filename && (
+          <span className="flex items-center gap-1 text-xs text-slate-500">
+            <FileText className="w-3.5 h-3.5" />
+            {entry.doc_filename}
+            {entry.amendment_number !== undefined && (
+              <span className="text-slate-400 ml-1">(Amd #{entry.amendment_number})</span>
+            )}
+          </span>
+        )}
+      </div>
+      {entry.reasoning && (
+        <p className="text-sm text-slate-700 leading-relaxed mb-2">
+          {entry.reasoning}
+        </p>
+      )}
+      <div className="flex items-center gap-2">
+        <div className="w-16 h-1.5 bg-amber-100 rounded-full overflow-hidden">
+          <div
+            className={clsx('h-full rounded-full', confidenceBarColor(entry.confidence))}
+            style={{ width: `${entry.confidence * 100}%` }}
+          />
+        </div>
+        <span className={clsx('text-xs font-medium', confidenceLabelColor(entry.confidence))}>
+          {(entry.confidence * 100).toFixed(0)}%
+        </span>
+      </div>
     </div>
   );
 }
