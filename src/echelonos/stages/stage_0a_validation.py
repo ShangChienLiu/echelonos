@@ -32,6 +32,27 @@ from pypdf.errors import FileNotDecryptedError, PdfReadError
 log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# macOS junk-file detection
+# ---------------------------------------------------------------------------
+
+# Directory names and filename patterns created by macOS that should be
+# silently excluded from processing.
+_MACOS_JUNK_DIRS = {"__MACOSX"}
+_MACOS_JUNK_FILES = {".DS_Store", "._.DS_Store", "Thumbs.db"}
+
+
+def _is_macos_junk(path: str) -> bool:
+    """Return True if *path* is a macOS resource-fork or metadata file."""
+    parts = Path(path).parts
+    if any(p in _MACOS_JUNK_DIRS for p in parts):
+        return True
+    basename = os.path.basename(path)
+    if basename in _MACOS_JUNK_FILES or basename.startswith("._"):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Format classification tables
 # ---------------------------------------------------------------------------
 
@@ -529,7 +550,7 @@ def _extract_zip_contents(file_path: str, output_dir: str) -> list[str]:
 
             zf.extractall(str(out))
             for member in members:
-                if not member.is_dir():
+                if not member.is_dir() and not _is_macos_junk(member.filename):
                     extracted_paths.append(str(out / member.filename))
 
         log.debug(
@@ -951,9 +972,13 @@ def validate_folder(folder_path: str) -> list[dict]:
         log.error("folder_not_found", folder_path=folder_path)
         return results
 
-    for dirpath, _dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune macOS metadata directories in-place so os.walk skips them.
+        dirnames[:] = [d for d in dirnames if d not in _MACOS_JUNK_DIRS]
         for fname in sorted(filenames):
             full_path = os.path.join(dirpath, fname)
+            if _is_macos_junk(full_path):
+                continue
             result = validate_file(full_path)
             results.append(result)
 

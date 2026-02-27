@@ -334,8 +334,13 @@ async def upload_documents(
             with zipfile.ZipFile(zip_path, "r") as zf:
                 zf.extractall(org_dir)
 
+            from echelonos.stages.stage_0a_validation import _is_macos_junk
+
             total_uploaded = sum(
-                1 for _, _, files in os.walk(org_dir) for _ in files
+                1
+                for dirpath, _, fnames in os.walk(org_dir)
+                for f in fnames
+                if not _is_macos_junk(os.path.join(dirpath, f))
             )
 
         else:

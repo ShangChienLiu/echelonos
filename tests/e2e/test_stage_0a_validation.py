@@ -598,6 +598,22 @@ class TestValidateFolder:
         results = validate_folder(str(tmp_path / "nope"))
         assert results == []
 
+    def test_folder_validation_skips_macos_junk(self, tmp_org_folder: Path, sample_pdf: Path) -> None:
+        """__MACOSX directories and .DS_Store files should be excluded."""
+        macos_dir = tmp_org_folder / "__MACOSX"
+        macos_dir.mkdir()
+        (macos_dir / "._sample.pdf").write_bytes(b"resource fork")
+        (tmp_org_folder / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1")
+
+        results = validate_folder(str(tmp_org_folder))
+
+        paths = [r["file_path"] for r in results]
+        assert not any("__MACOSX" in p for p in paths), "Should skip __MACOSX files"
+        assert not any(".DS_Store" in p for p in paths), "Should skip .DS_Store"
+        # Only the sample PDF should be found
+        assert len(results) == 1
+        assert results[0]["status"] == "VALID"
+
     def test_folder_validation_recursive(self, tmp_org_folder: Path) -> None:
         """Files inside sub-directories should also be discovered."""
         sub = tmp_org_folder / "subdir"

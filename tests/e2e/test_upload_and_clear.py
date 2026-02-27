@@ -143,6 +143,32 @@ class TestUploadEndpoint:
         assert data["status"] == "ok"
         assert data["total_uploaded"] == 2
 
+    def test_upload_zip_excludes_macos_junk(self, client: TestClient):
+        """Uploading a zip with __MACOSX and .DS_Store should not inflate total_uploaded."""
+        import zipfile as _zf
+
+        pdf_bytes = _make_minimal_pdf()
+        buf = io.BytesIO()
+        with _zf.ZipFile(buf, "w") as zf:
+            # 2 real PDFs
+            zf.writestr("doc1.pdf", pdf_bytes)
+            zf.writestr("doc2.pdf", pdf_bytes)
+            # macOS junk that should be excluded from count
+            zf.writestr("__MACOSX/._doc1.pdf", b"resource fork data")
+            zf.writestr("__MACOSX/._doc2.pdf", b"resource fork data")
+            zf.writestr(".DS_Store", b"\x00\x00\x00\x01Bud1")
+        buf.seek(0)
+
+        resp = client.post(
+            "/api/upload",
+            files=[("files", ("TestOrg.zip", buf, "application/zip"))],
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        # total_uploaded should be 2 (real files), not 5
+        assert data["total_uploaded"] == 2
+
     def test_upload_returns_elapsed_time(self, client: TestClient):
         pdf_bytes = _make_minimal_pdf()
         resp = client.post(
