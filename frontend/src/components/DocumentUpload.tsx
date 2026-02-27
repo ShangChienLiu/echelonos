@@ -137,8 +137,9 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
         {/* Clear database button — inline in header */}
         {!confirmClear ? (
           <button
+            type="button"
             onClick={() => setConfirmClear(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-500 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors cursor-pointer"
           >
             <Trash2 className="w-3.5 h-3.5" />
             Clear Database
@@ -147,15 +148,17 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
           <div className="flex items-center gap-2">
             <span className="text-xs text-red-600 font-medium">Delete all data?</span>
             <button
+              type="button"
               onClick={handleClear}
               disabled={clearing}
-              className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-md hover:bg-red-700 disabled:opacity-50 transition-colors"
+              className="px-2.5 py-1 text-xs font-medium text-white bg-red-600 rounded-md hover:bg-red-700 disabled:opacity-50 transition-colors cursor-pointer"
             >
               {clearing ? 'Clearing...' : 'Confirm'}
             </button>
             <button
+              type="button"
               onClick={() => setConfirmClear(false)}
-              className="px-2.5 py-1 text-xs font-medium text-slate-500 bg-slate-100 rounded-md hover:bg-slate-200 transition-colors"
+              className="px-2.5 py-1 text-xs font-medium text-slate-500 bg-slate-100 rounded-md hover:bg-slate-200 transition-colors cursor-pointer"
             >
               Cancel
             </button>
@@ -229,6 +232,7 @@ export default function DocumentUpload({ onUploadComplete, onClearDatabase }: Do
                 )}
               </span>
               <button
+                type="button"
                 onClick={handleUpload}
                 disabled={uploading}
                 className={clsx(

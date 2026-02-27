@@ -19,30 +19,36 @@ interface OrgOption {
 
 function App() {
   const [report, setReport] = useState<ObligationReport | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>('obligations');
   const [selectedObligation, setSelectedObligation] = useState<ObligationRow | null>(null);
   const [organizations, setOrganizations] = useState<OrgOption[]>([]);
-  const [selectedOrg, setSelectedOrg] = useState<string>('demo-org');
+  const [selectedOrg, setSelectedOrg] = useState<string>('');
+
+  const fetchOrganizations = useCallback(async () => {
+    try {
+      const res = await fetch('/api/organizations');
+      if (res.ok) {
+        const orgs: OrgOption[] = await res.json();
+        setOrganizations(orgs);
+        return orgs;
+      }
+    } catch {
+      // API not available
+    }
+    return [];
+  }, []);
 
   // Fetch available organizations on mount
   useEffect(() => {
     (async () => {
-      try {
-        const res = await fetch('/api/organizations');
-        if (res.ok) {
-          const orgs: OrgOption[] = await res.json();
-          setOrganizations(orgs);
-          if (orgs.length > 0) {
-            setSelectedOrg(orgs[0].name);
-          }
-        }
-      } catch {
-        // API not available — keep default
+      const orgs = await fetchOrganizations();
+      if (orgs.length > 0) {
+        setSelectedOrg(orgs[0].name);
       }
     })();
-  }, []);
+  }, [fetchOrganizations]);
 
   const fetchReport = useCallback(async () => {
     if (!selectedOrg) {
@@ -58,12 +64,10 @@ function App() {
         const data: ObligationReport = await res.json();
         setReport(data);
       } else {
-        // API not available, use mock data
         console.info('API not available, using mock data');
         setReport(mockReport);
       }
     } catch {
-      // Network error, use mock data
       console.info('Network error, using mock data');
       setReport(mockReport);
     } finally {
@@ -75,30 +79,41 @@ function App() {
     fetchReport();
   }, [fetchReport]);
 
-  const refreshAfterUpload = useCallback(async () => {
-    // Re-fetch org list then re-fetch report.
+  const handleRefresh = useCallback(async () => {
+    setLoading(true);
     try {
-      const res = await fetch('/api/organizations');
-      if (res.ok) {
-        const orgs: OrgOption[] = await res.json();
-        setOrganizations(orgs);
-        if (orgs.length > 0 && !orgs.find((o) => o.name === selectedOrg)) {
+      const orgs = await fetchOrganizations();
+      if (orgs.length > 0) {
+        if (!selectedOrg || !orgs.find((o) => o.name === selectedOrg)) {
           setSelectedOrg(orgs[0].name);
+          // fetchReport will auto-fire via useEffect when selectedOrg changes.
+          return;
         }
       }
-    } catch {
-      // ignore
+      await fetchReport();
+    } finally {
+      setLoading(false);
     }
-    fetchReport();
-  }, [fetchReport, selectedOrg]);
+  }, [fetchOrganizations, fetchReport, selectedOrg]);
+
+  const refreshAfterUpload = useCallback(async () => {
+    const orgs = await fetchOrganizations();
+    if (orgs.length > 0) {
+      if (!selectedOrg || !orgs.find((o) => o.name === selectedOrg)) {
+        setSelectedOrg(orgs[0].name);
+        return;
+      }
+    }
+    await fetchReport();
+  }, [fetchOrganizations, fetchReport, selectedOrg]);
 
   const handleClearDatabase = useCallback(async () => {
-    const res = await fetch('/api/database', { method: 'DELETE' });
-    if (!res.ok) throw new Error('Failed to clear database');
+    await fetch('/api/database', { method: 'DELETE' });
     setOrganizations([]);
     setSelectedOrg('');
     setReport(null);
     setLoading(false);
+    setError(null);
   }, []);
 
   const tabs: { id: Tab; label: string; icon: typeof Table2 }[] = [
@@ -159,9 +174,9 @@ function App() {
                 </span>
               )}
               <button
-                onClick={fetchReport}
-                disabled={loading}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-md transition-colors disabled:opacity-50"
+                type="button"
+                onClick={handleRefresh}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-md transition-colors"
               >
                 <RefreshCw className={clsx('w-3.5 h-3.5', loading && 'animate-spin')} />
                 Refresh
