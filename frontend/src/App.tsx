@@ -58,6 +58,16 @@ function App() {
     }
     setLoading(true);
     setError(null);
+
+    // Allow ?mock=1 to force mock data for UI development/testing.
+    const useMock = new URLSearchParams(window.location.search).get('mock') === '1';
+    if (useMock) {
+      console.info('Mock mode enabled via ?mock=1');
+      setReport(mockReport);
+      setLoading(false);
+      return;
+    }
+
     try {
       const res = await fetch(`/api/report/${encodeURIComponent(selectedOrg)}`);
       if (res.ok) {
