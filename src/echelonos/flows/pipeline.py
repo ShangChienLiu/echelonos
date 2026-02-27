@@ -1,10 +1,12 @@
 """Main pipeline flow orchestrating all 8 stages."""
 
 import os
+import shutil
 
 from prefect import flow, task
 import structlog
 
+from echelonos.config import settings
 from echelonos.db.session import SessionLocal
 from echelonos.db.persist import get_or_create_organization, upsert_document
 
@@ -31,10 +33,22 @@ def stage_0b_dedup(valid_files: list[dict]) -> list[dict]:
 def persist_stage_0(org_folder: str, unique_files: list[dict]) -> dict:
     """Persist organization and documents after stages 0a/0b."""
     org_name = os.path.basename(org_folder.rstrip("/"))
+
+    # Copy files from source folder → persistent upload_dir.
+    persistent_org_dir = os.path.join(settings.upload_dir, org_name)
+    os.makedirs(persistent_org_dir, exist_ok=True)
+    for f in unique_files:
+        src = f["file_path"]
+        rel = os.path.relpath(src, org_folder)
+        dst = os.path.join(persistent_org_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        f["file_path"] = dst
+
     db = SessionLocal()
     try:
         org = get_or_create_organization(
-            db, name=org_name, folder_path=org_folder,
+            db, name=org_name, folder_path=persistent_org_dir,
         )
         doc_ids = []
         for f in unique_files:

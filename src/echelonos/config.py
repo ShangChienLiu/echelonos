@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # Prefect
     prefect_api_url: str = "http://localhost:4200/api"
 
+    # File storage
+    upload_dir: str = "data/uploads"
+
     @property
     def database_url(self) -> str:
         return (

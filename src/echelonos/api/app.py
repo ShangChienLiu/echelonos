@@ -303,6 +303,7 @@ async def upload_documents(
     import zipfile
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    from echelonos.config import settings
     from echelonos.db.persist import get_or_create_organization, upsert_document
 
     start = time.time()
@@ -385,8 +386,19 @@ async def upload_documents(
         valid_files = [f for f in validated if f["status"] == "VALID"]
         unique_files = deduplicate_files(valid_files)
 
+        # Copy unique files from temp → persistent upload_dir.
+        persistent_org_dir = os.path.join(settings.upload_dir, org_name)
+        os.makedirs(persistent_org_dir, exist_ok=True)
+        for f in unique_files:
+            src = f["file_path"]
+            rel = os.path.relpath(src, org_dir)
+            dst = os.path.join(persistent_org_dir, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            f["file_path"] = dst
+
         # Persist to DB.
-        org = get_or_create_organization(db, name=org_name, folder_path=org_dir)
+        org = get_or_create_organization(db, name=org_name, folder_path=persistent_org_dir)
         doc_ids: list[str] = []
         for f in unique_files:
             doc = upsert_document(
@@ -489,6 +501,14 @@ def clear_database(db: Session = Depends(get_db)) -> dict:
 
     db.commit()
     _reset_pipeline_status()
+
+    # Remove persistent uploaded files to prevent orphans.
+    from echelonos.config import settings as _settings
+    upload_dir = _settings.upload_dir
+    if os.path.isdir(upload_dir):
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        logger.info("Removed upload directory: %s", upload_dir)
+
     logger.info("Database cleared: %s", counts)
     return {"status": "ok", "deleted": counts}
 

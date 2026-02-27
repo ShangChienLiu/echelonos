@@ -48,3 +48,6 @@ frontend/.next/
 # Logs
 *.log
 logs/
+
+# Uploaded data
+data/
