@@ -18,6 +18,7 @@ from echelonos.stages.stage_0b_dedup import (
     compute_simhash,
     compute_structural_fingerprint,
     deduplicate_files,
+    extract_identity_tokens,
     extract_text,
     hamming_distance,
 )
@@ -532,3 +533,115 @@ class TestComputeContentHash:
 
     def test_punctuation_insensitive(self):
         assert compute_content_hash("hello, world!") == compute_content_hash("hello world")
+
+
+class TestExtractIdentityTokens:
+    """Identity tokens extract PO numbers, dollar amounts, and dates from text."""
+
+    def test_extracts_po_numbers(self):
+        text = "Purchase Order 4501693981 for 7th Street Solutions"
+        tokens = extract_identity_tokens(text)
+        assert "4501693981" in tokens
+
+    def test_extracts_dollar_amounts(self):
+        text = "Total amount due: $3,800.00 payable within Net 30"
+        tokens = extract_identity_tokens(text)
+        assert "$3,800.00" in tokens
+
+    def test_extracts_dates(self):
+        text = "Effective date 05/13/2025 through 06/02/2025"
+        tokens = extract_identity_tokens(text)
+        assert "05/13/2025" in tokens
+        assert "06/02/2025" in tokens
+
+    def test_different_pos_produce_different_tokens(self):
+        text_a = "Purchase Order 4501693981 Date 05/13/2025 Amount $3,800.00"
+        text_b = "Purchase Order 4501703538 Date 06/02/2025 Amount $4,125.00"
+        assert extract_identity_tokens(text_a) != extract_identity_tokens(text_b)
+
+    def test_identical_text_produces_same_tokens(self):
+        text = "Invoice 12345 dated 01/15/2024 total $100,000"
+        assert extract_identity_tokens(text) == extract_identity_tokens(text)
+
+    def test_empty_text_produces_empty_tokens(self):
+        assert extract_identity_tokens("") == ""
+        assert extract_identity_tokens("no numbers here") == ""
+
+
+class TestIdentityTokensPreventSimhashFalsePositives:
+    """Template-based documents with different identifying details (PO numbers,
+    amounts, dates) should NOT be collapsed by Layer 3, because their identity
+    tokens differ and Layer 4 protects them.
+    """
+
+    def test_same_template_different_po_numbers_kept(self, tmp_path: Path):
+        """Two POs from the same vendor template with different PO numbers,
+        dates, and amounts must both survive dedup.  We use a word-order
+        swap plus different PO details so SimHash distance is 0 (would be
+        flagged by Layer 3) but identity tokens differ (Layer 4 protects).
+        """
+        # Long shared boilerplate with identifying details that differ
+        boilerplate = (
+            "7th Street Solutions LLC Temporary Staffing Services "
+            "Terms and Conditions Net 30 Ship to 123 Main Street "
+            "Authorized by John Smith Department of Operations "
+            "General Manager Cadillac Products Automotive Company "
+            "This purchase order is subject to the terms and conditions "
+            "attached hereto and incorporated herein by reference"
+        )
+        po_a = f"Purchase Order 4501693981 Date 05/13/2025 Amount $3,800.00 {boilerplate}"
+        # Same words in different order + different PO details -> SimHash ~0
+        po_b = f"Purchase Order 4501703538 Date 06/02/2025 Amount $4,125.00 {boilerplate}"
+
+        pdf_a = _make_pdf(tmp_path / "po_a.pdf", po_a)
+        pdf_b = _make_pdf(tmp_path / "po_b.pdf", po_b)
+
+        text_a = extract_text(str(pdf_a))
+        text_b = extract_text(str(pdf_b))
+
+        # Identity tokens must differ
+        assert extract_identity_tokens(text_a) != extract_identity_tokens(text_b)
+
+        files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+        unique = deduplicate_files(files)
+
+        # Both should survive — different POs protected by identity tokens
+        assert len(unique) == 2, (
+            f"Expected 2 unique POs, got {len(unique)}; "
+            f"identity tokens should have protected them"
+        )
+
+    def test_true_duplicate_different_format_still_caught(self, tmp_path: Path):
+        """A true near-duplicate (same document, word-order swap) with the
+        same identity tokens should still be caught by Layer 3.
+        """
+        base_text = (
+            "Advisory Agreement effective 5/27/2025 between Ascension Corp "
+            "and Rexair LLC for consulting services total fee $100,000 "
+            "reference number 49601 payment terms net thirty days"
+        )
+        # Word-order swap — same tokens, different content hash
+        variant_text = (
+            "Advisory Agreement effective 5/27/2025 between Rexair LLC "
+            "and Ascension Corp for consulting services total fee $100,000 "
+            "reference number 49601 payment terms net thirty days"
+        )
+
+        pdf_a = _make_pdf(tmp_path / "original.pdf", base_text)
+        pdf_b = _make_pdf(tmp_path / "variant.pdf", variant_text)
+
+        text_a = extract_text(str(pdf_a))
+        text_b = extract_text(str(pdf_b))
+
+        # Same identity tokens
+        assert extract_identity_tokens(text_a) == extract_identity_tokens(text_b)
+        # Different content hash
+        assert compute_content_hash(text_a) != compute_content_hash(text_b)
+
+        files = [_entry(str(pdf_a)), _entry(str(pdf_b))]
+        unique = deduplicate_files(files)
+
+        # Should be deduped — same identity tokens, SimHash match
+        assert len(unique) == 1
+        assert files[1]["is_duplicate"] is True
+        assert files[1]["dedup_layer"] == 3
