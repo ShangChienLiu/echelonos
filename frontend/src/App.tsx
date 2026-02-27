@@ -8,6 +8,7 @@ import ObligationTable from './components/ObligationTable';
 import FlagPanel from './components/FlagPanel';
 import EvidenceDrawer from './components/EvidenceDrawer';
 import SummaryCharts from './components/SummaryCharts';
+import DocumentUpload from './components/DocumentUpload';
 
 type Tab = 'obligations' | 'flags' | 'summary';
 
@@ -66,6 +67,32 @@ function App() {
   }, [selectedOrg]);
 
   useEffect(() => {
+    fetchReport();
+  }, [fetchReport]);
+
+  const refreshAfterUpload = useCallback(async () => {
+    // Re-fetch org list then re-fetch report.
+    try {
+      const res = await fetch('/api/organizations');
+      if (res.ok) {
+        const orgs: OrgOption[] = await res.json();
+        setOrganizations(orgs);
+        if (orgs.length > 0 && !orgs.find((o) => o.name === selectedOrg)) {
+          setSelectedOrg(orgs[0].name);
+        }
+      }
+    } catch {
+      // ignore
+    }
+    fetchReport();
+  }, [fetchReport, selectedOrg]);
+
+  const handleClearDatabase = useCallback(async () => {
+    const res = await fetch('/api/database', { method: 'DELETE' });
+    if (!res.ok) throw new Error('Failed to clear database');
+    setOrganizations([]);
+    setSelectedOrg('demo-org');
+    setReport(null);
     fetchReport();
   }, [fetchReport]);
 
@@ -141,6 +168,12 @@ function App() {
 
       {/* Main content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+        {/* Document Upload */}
+        <DocumentUpload
+          onUploadComplete={refreshAfterUpload}
+          onClearDatabase={handleClearDatabase}
+        />
+
         {/* Loading */}
         {loading && !report && (
           <div className="flex items-center justify-center py-24">
