@@ -644,6 +644,17 @@ def extract_and_verify(
             cove_passed=cove_result.get("cove_passed") if cove_result else None,
         )
 
+    # Resolve role labels (e.g. "GRANTOR") to actual entity names
+    # (e.g. "Lake Industries Inc.") using the party_roles mapping.
+    role_to_entity = {role.lower(): entity for role, entity in party_roles.items()}
+    for entry in results:
+        obl = entry.get("obligation", {})
+        for field in ("responsible_party", "counterparty"):
+            value = obl.get(field, "")
+            resolved = role_to_entity.get(value.lower())
+            if resolved:
+                obl[field] = resolved
+
     log.info(
         "pipeline_complete",
         total=len(results),

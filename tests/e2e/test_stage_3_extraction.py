@@ -407,7 +407,8 @@ class TestFullPipeline:
 
         # Obligation data is present.
         assert entry["obligation"]["obligation_type"] == "Delivery"
-        assert entry["obligation"]["responsible_party"] == "Vendor"
+        # Role labels are resolved to entity names via party_roles mapping.
+        assert entry["obligation"]["responsible_party"] == "CDW Government LLC"
 
         # Grounding passes (source_clause is in the contract text).
         assert entry["grounding"] is True
