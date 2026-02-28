@@ -512,66 +512,49 @@ class TestResolveChainEndToEnd:
 
         - Delivery obligation: SUPERSEDED by Amendment #1
         - Payment obligation: stays ACTIVE (MODIFY keeps it active)
-        - Confidentiality: ACTIVE (untouched by heuristic + type mismatch)
+        - Confidentiality: stays ACTIVE (unrelated amendments)
         - SLA: TERMINATED by Amendment #2
         """
-        # The LLM call sequence depends on which pairs pass the pre-filter.
-        # Pairs are compared when either:
-        #   (a) obligation_type matches (same type bypass), or
-        #   (b) keyword overlap >= 20% (heuristic)
-        #
-        # Actual call order with the current heuristic + type-match:
-        #   1. Delivery vs Amend1-Delivery  (same type "Delivery") -> REPLACE
-        #   2. Delivery vs Amend1-Payment   (heuristic: vendor/within/30/days) -> UNCHANGED
-        #   3. Payment  vs Amend1-Delivery  (heuristic: vendor/within/days) -> UNCHANGED
-        #   4. Payment  vs Amend1-Payment   (same type "Financial") -> MODIFY
-        #   5. SLA      vs Amend2-SLA-Del   (same type "SLA") -> DELETE
-        #
-        # Confidentiality has no type match and <20% overlap with all
-        # amendments, so zero LLM calls for it.
-        # SLA has no heuristic match with Amend1 obligations (<20% overlap)
-        # but matches Amend2-SLA-Delete via same type.
-        responses = [
-            # 1. MSA Delivery vs AMEND_1_DELIVERY -> REPLACE (same type)
-            _make_comparison_response(
-                action="REPLACE",
-                reasoning="Delivery timeline changed from 30 calendar days to 15 business days.",
-                confidence=0.95,
-            ),
-            # 2. MSA Delivery vs AMEND_1_PAYMENT -> UNCHANGED (heuristic)
-            _make_comparison_response(
+        # Use a side_effect function that returns the correct response
+        # based on the actual clause content being compared, making the
+        # test robust against changes in the heuristic pre-filter.
+        def _smart_mock(*args, **kwargs):
+            # compare_clauses passes:
+            #   system_prompt = _CLAUSE_COMPARISON_SYSTEM_PROMPT (template)
+            #   user_prompt = "Original clause:\n{orig}\n\nAmendment clause:\n{amend}"
+            user = kwargs.get("user_prompt", "") or (args[2] if len(args) > 2 else "")
+
+            # Split into original and amendment portions.
+            parts = user.split("Amendment clause:")
+            original_part = parts[0] if parts else ""
+            amendment_part = parts[1] if len(parts) > 1 else ""
+
+            # Delivery vs Amend1-Delivery: REPLACE
+            if "30 calendar days" in original_part and "15 business days" in amendment_part:
+                return _make_comparison_response(
+                    action="REPLACE",
+                    reasoning="Delivery timeline changed from 30 to 15 business days.",
+                    confidence=0.95,
+                )
+            # Payment vs Amend1-Payment: MODIFY
+            if "45 days" in original_part and "30 days" in amendment_part:
+                return _make_comparison_response(
+                    action="MODIFY",
+                    reasoning="Payment term changed from 45 to 30 days.",
+                    confidence=0.91,
+                )
+            # SLA vs Amend2-SLA-Delete: DELETE (original must be about uptime)
+            if "99.9%" in original_part and "deleted" in amendment_part.lower():
+                return _make_comparison_response(
+                    action="DELETE",
+                    reasoning="Section 4.1 is explicitly deleted.",
+                    confidence=0.96,
+                )
+            # Default: UNCHANGED
+            return _make_comparison_response(
                 action="UNCHANGED",
                 reasoning="Different subject matter.",
                 confidence=0.98,
-            ),
-            # 3. MSA Payment vs AMEND_1_DELIVERY -> UNCHANGED (heuristic)
-            _make_comparison_response(
-                action="UNCHANGED",
-                reasoning="Different subject matter.",
-                confidence=0.97,
-            ),
-            # 4. MSA Payment vs AMEND_1_PAYMENT -> MODIFY (same type)
-            _make_comparison_response(
-                action="MODIFY",
-                reasoning="Payment term changed from 45 to 30 days, interest rate reduced.",
-                confidence=0.91,
-            ),
-            # 5. MSA SLA vs AMEND_2_SLA_DELETE -> DELETE (same type)
-            _make_comparison_response(
-                action="DELETE",
-                reasoning="Section 4.1 is explicitly deleted in its entirety.",
-                confidence=0.96,
-            ),
-        ]
-
-        # Safety buffer in case the heuristic passes additional pairs.
-        for _ in range(10):
-            responses.append(
-                _make_comparison_response(
-                    action="UNCHANGED",
-                    reasoning="Different subject matter.",
-                    confidence=0.99,
-                )
             )
 
         chain_docs = [
@@ -602,7 +585,7 @@ class TestResolveChainEndToEnd:
             },
         ]
 
-        with _patch_structured_side_effect(responses):
+        with _patch_structured_side_effect(_smart_mock):
             resolved = resolve_amendment_chain(chain_docs, claude_client=MagicMock())
 
         # Collect results by source.
@@ -630,6 +613,8 @@ class TestResolveChainEndToEnd:
             r for r in msa_resolved
             if "confidentiality" in r.get("obligation_text", "").lower()
         )
+        # Smart mock returns UNCHANGED for unrelated pairs, so
+        # confidentiality stays ACTIVE.
         assert confidentiality["status"] == "ACTIVE"
 
         sla = next(

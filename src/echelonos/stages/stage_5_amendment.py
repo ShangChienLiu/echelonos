@@ -249,9 +249,11 @@ def _clauses_potentially_related(
         return False
 
     overlap = orig_words & amend_words
-    # If at least 20% of the smaller set overlaps, consider them related.
+    # If at least 10% of the smaller set overlaps, consider them related.
+    # Threshold is deliberately low because amendments often change party
+    # names (e.g. "Licensee" → "GRANTEE") and rephrase terms.
     min_size = min(len(orig_words), len(amend_words))
-    return len(overlap) / min_size >= 0.20
+    return len(overlap) / min_size >= 0.10
 
 
 def resolve_obligation(
@@ -299,14 +301,23 @@ def resolve_obligation(
 
         # Quick heuristic: skip comparison if clauses are clearly unrelated.
         # Always compare if obligation types match (e.g. both "SLA").
+        # Also compare source_clause text as fallback since amendments often
+        # use different party names (e.g. "Licensee" vs "GRANTEE").
         orig_text = obligation.get("obligation_text", "")
         amend_text = amend_obl.get("obligation_text", "")
         same_type = (
             obligation.get("obligation_type")
             and obligation.get("obligation_type") == amend_obl.get("obligation_type")
         )
-        if not same_type and not _clauses_potentially_related(orig_text, amend_text):
-            continue
+        if not same_type:
+            related = _clauses_potentially_related(orig_text, amend_text)
+            if not related:
+                # Fallback: compare source_clause text too.
+                orig_clause = obligation.get("source_clause", "")
+                amend_clause = amend_obl.get("source_clause", "")
+                related = _clauses_potentially_related(orig_clause, amend_clause)
+            if not related:
+                continue
 
         # LLM comparison.
         resolution = compare_clauses(
